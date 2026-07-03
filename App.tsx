@@ -586,11 +586,16 @@ function App(): React.JSX.Element {
               </TouchableOpacity>
             </>
           ) : (
-            !atSummary && (
-              <TouchableOpacity style={styles.pillButton} onPress={resetCurrentQueue}>
-                <Text style={styles.pillButtonText}>Reset</Text>
+            <>
+              {!atSummary && (
+                <TouchableOpacity style={styles.pillButton} onPress={resetCurrentQueue}>
+                  <Text style={styles.pillButtonText}>Reset</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity style={styles.pillButton} onPress={() => setMode('edit')}>
+                <Text style={styles.pillButtonText}>Exit Quiz</Text>
               </TouchableOpacity>
-            )
+            </>
           )}
         </View>
       </View>
