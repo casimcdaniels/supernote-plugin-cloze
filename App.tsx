@@ -17,9 +17,11 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Image,
   PanResponder,
   Pressable,
+  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -28,11 +30,23 @@ import {
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {Element, PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
+import {
+  Element,
+  PluginCommAPI,
+  PluginFileAPI,
+  PluginManager,
+} from 'sn-plugin-lib';
 
 type Mode = 'edit' | 'quiz';
 type Grade = 'unseen' | 'known' | 'missed';
 type QuizScope = 'page' | 'all';
+type Screen = 'editor' | 'manage';
+
+interface DeckSummary {
+  notePath: string;
+  pageCount: number;
+  clozeCount: number;
+}
 
 interface ClozeBox {
   id: string;
@@ -77,7 +91,10 @@ interface QuizCard {
   id: string;
 }
 
-type PersistedClozeBox = Pick<ClozeBox, 'id' | 'x' | 'y' | 'width' | 'height' | 'grade'>;
+type PersistedClozeBox = Pick<
+  ClozeBox,
+  'id' | 'x' | 'y' | 'width' | 'height' | 'grade'
+>;
 interface PersistedPageEntry {
   anchor: PageAnchor | null;
   clozes: PersistedClozeBox[];
@@ -98,7 +115,9 @@ function storageKeyForNote(notePath: string): string {
 }
 
 function newAnchorToken(): string {
-  return `${ANCHOR_TOKEN_PREFIX}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  return `${ANCHOR_TOKEN_PREFIX}${Date.now().toString(36)}${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
 }
 
 function shuffleArray<T>(items: T[]): T[] {
@@ -121,13 +140,15 @@ function App(): React.JSX.Element {
 
   const [mode, setMode] = useState<Mode>('edit');
   const [shuffle, setShuffle] = useState(false);
-  const [anchorDebug, setAnchorDebug] = useState<string | null>(null);
-  const [syncDebug, setSyncDebug] = useState<string | null>(null);
   const [draftRect, setDraftRect] = useState<DraftRect | null>(null);
 
   const [quizScope, setQuizScope] = useState<QuizScope>('page');
   const [quizQueue, setQuizQueue] = useState<QuizCard[]>([]);
   const [quizIndex, setQuizIndex] = useState(0);
+
+  const [screen, setScreen] = useState<Screen>('editor');
+  const [decks, setDecks] = useState<DeckSummary[]>([]);
+  const [decksLoading, setDecksLoading] = useState(false);
 
   const notePathRef = useRef<string | null>(null);
   const pluginDirRef = useRef<string | null>(null);
@@ -140,7 +161,6 @@ function App(): React.JSX.Element {
   currentPageRef.current = currentPage;
   const totalPagesRef = useRef(totalPages);
   totalPagesRef.current = totalPages;
-  const syncRunCountRef = useRef(0);
 
   const handleClose = () => {
     PluginManager.closePluginView();
@@ -156,7 +176,8 @@ function App(): React.JSX.Element {
     try {
       const pluginDir =
         pluginDirRef.current ??
-        (pluginDirRef.current = (await PluginManager.getPluginDirPath()) ?? null);
+        (pluginDirRef.current =
+          (await PluginManager.getPluginDirPath()) ?? null);
       if (!pluginDir) {
         setError('Could not access plugin storage directory.');
         return;
@@ -165,7 +186,10 @@ function App(): React.JSX.Element {
       const pngPath = `${pluginDir}/cloze_snapshot_p${page}_${Date.now()}.png`;
       let aspectRatio = pagesRef.current[page]?.aspectRatio ?? 0.75;
 
-      const sizeRes: any = await PluginFileAPI.getPageSize(notePathRef.current, page);
+      const sizeRes: any = await PluginFileAPI.getPageSize(
+        notePathRef.current,
+        page,
+      );
       if (sizeRes?.success && sizeRes.result?.width && sizeRes.result?.height) {
         aspectRatio = sizeRes.result.height / sizeRes.result.width;
       }
@@ -184,7 +208,12 @@ function App(): React.JSX.Element {
       }
 
       setPages(prev => {
-        const existing = prev[page] ?? {imageUri: null, aspectRatio, clozes: [], anchor: null};
+        const existing = prev[page] ?? {
+          imageUri: null,
+          aspectRatio,
+          clozes: [],
+          anchor: null,
+        };
         return {
           ...prev,
           [page]: {...existing, imageUri: `file://${pngPath}`, aspectRatio},
@@ -197,7 +226,11 @@ function App(): React.JSX.Element {
 
   // Finds our marker text element on a page by its token, if one exists there.
   const findAnchorElement = useCallback(
-    async (notePath: string, page: number, token: string): Promise<{num: number} | null> => {
+    async (
+      notePath: string,
+      page: number,
+      token: string,
+    ): Promise<{num: number} | null> => {
       try {
         const res: any = await PluginFileAPI.getElements(page, notePath);
         const elements = res?.success ? res.result : null;
@@ -205,7 +238,9 @@ function App(): React.JSX.Element {
           return null;
         }
         const match = elements.find(
-          (el: any) => el?.type === Element.TYPE_TEXT && el?.textBox?.textContentFull === token,
+          (el: any) =>
+            el?.type === Element.TYPE_TEXT &&
+            el?.textBox?.textContentFull === token,
         );
         if (!match) {
           return null;
@@ -233,26 +268,25 @@ function App(): React.JSX.Element {
   // since our own Prev/Next Page buttons browse independently of the live note.
   // insertElements takes an explicit page, so this works for any page.
   const ensurePageAnchor = useCallback(
-    async (notePath: string, page: number): Promise<{anchor: PageAnchor | null; debug: string}> => {
-      const steps: string[] = [];
+    async (notePath: string, page: number): Promise<PageAnchor | null> => {
       try {
         const sizeRes: any = await PluginFileAPI.getPageSize(notePath, page);
-        steps.push(
-          `size:${sizeRes?.success ? `ok(${sizeRes.result?.width}x${sizeRes.result?.height})` : `fail(${sizeRes?.error?.message ?? sizeRes?.error?.code})`}`,
-        );
-        if (!sizeRes?.success || !sizeRes.result?.width || !sizeRes.result?.height) {
-          return {anchor: null, debug: steps.join(' ')};
+        if (
+          !sizeRes?.success ||
+          !sizeRes.result?.width ||
+          !sizeRes.result?.height
+        ) {
+          return null;
         }
         const left = sizeRes.result.width + ANCHOR_MARGIN;
         const top = sizeRes.result.height + ANCHOR_MARGIN;
         const token = newAnchorToken();
 
-        const createRes: any = await PluginCommAPI.createElement(Element.TYPE_TEXT);
-        steps.push(
-          `create:${createRes?.success ? 'ok' : `fail(${createRes?.error?.code}:${createRes?.error?.message})`}`,
+        const createRes: any = await PluginCommAPI.createElement(
+          Element.TYPE_TEXT,
         );
         if (!createRes?.success || !createRes?.result) {
-          return {anchor: null, debug: steps.join(' ')};
+          return null;
         }
 
         const element = createRes.result;
@@ -260,7 +294,12 @@ function App(): React.JSX.Element {
         element.textBox = {
           ...(element.textBox ?? {}),
           textContentFull: token,
-          textRect: {left, top, right: left + ANCHOR_SIZE, bottom: top + ANCHOR_SIZE},
+          textRect: {
+            left,
+            top,
+            right: left + ANCHOR_SIZE,
+            bottom: top + ANCHOR_SIZE,
+          },
           fontSize: 8,
           textAlign: 0,
           textBold: 0,
@@ -270,71 +309,171 @@ function App(): React.JSX.Element {
           textEditable: 1, // 0=editable, 1=non-editable per the docs
         };
 
-        const insertRes: any = await PluginFileAPI.insertElements(notePath, page, [element]);
-        steps.push(
-          `insert:${insertRes?.success ? `ok(${insertRes.result})` : `fail(${insertRes?.error?.code}:${insertRes?.error?.message})`}`,
+        const insertRes: any = await PluginFileAPI.insertElements(
+          notePath,
+          page,
+          [element],
         );
-        console.log('[ClozeQuiz] ensurePageAnchor insert response', JSON.stringify(insertRes));
         if (!insertRes?.success || !insertRes?.result) {
-          return {anchor: null, debug: steps.join(' ')};
+          return null;
         }
 
         const found = await findAnchorElement(notePath, page, token);
-        steps.push(`verify:${found ? 'ok' : 'not-found'}`);
-        if (!found) {
-          return {anchor: null, debug: steps.join(' ')};
-        }
-        return {anchor: {token}, debug: steps.join(' ')};
+        return found ? {token} : null;
       } catch (e) {
-        steps.push(`error:${(e as Error)?.message ?? String(e)}`);
-        return {anchor: null, debug: steps.join(' ')};
+        return null;
       }
     },
     [findAnchorElement],
   );
 
   // Best-effort: remove the marker element once a page's deck is cleared.
-  const deletePageAnchor = useCallback(async (notePath: string, page: number, anchor: PageAnchor) => {
-    try {
-      const found = await findAnchorElement(notePath, page, anchor.token);
-      if (found) {
-        await PluginFileAPI.deleteElements(notePath, page, [found.num]);
+  const deletePageAnchor = useCallback(
+    async (notePath: string, page: number, anchor: PageAnchor) => {
+      try {
+        const found = await findAnchorElement(notePath, page, anchor.token);
+        if (found) {
+          await PluginFileAPI.deleteElements(notePath, page, [found.num]);
+        }
+      } catch (e) {
+        // Nothing more we can do — worst case a stray marker lingers in the corner.
       }
-    } catch (e) {
-      // Nothing more we can do — worst case a stray marker lingers in the corner.
-    }
-  }, [findAnchorElement]);
+    },
+    [findAnchorElement],
+  );
 
-  const restorePersistedClozes = useCallback(async (notePath: string): Promise<Record<number, PageState>> => {
+  // Scans every note with saved cloze data (not just the currently open one)
+  // for the deck manager screen.
+  const loadDecks = useCallback(async () => {
+    setDecksLoading(true);
     try {
-      const raw = await AsyncStorage.getItem(storageKeyForNote(notePath));
-      if (!raw) {
-        return {};
-      }
-      const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
-      const restored: Record<number, PageState> = {};
-      for (const [pageStr, entry] of Object.entries(parsed)) {
-        if (!entry || !Array.isArray(entry.clozes) || entry.clozes.length === 0) {
+      const keys = await AsyncStorage.getAllKeys();
+      const clozeKeys = keys.filter(k => k.startsWith(STORAGE_PREFIX));
+      const entries = await AsyncStorage.multiGet(clozeKeys);
+      const summaries: DeckSummary[] = [];
+      for (const [key, raw] of entries) {
+        if (!raw) {
           continue;
         }
-        restored[Number(pageStr)] = {
-          imageUri: null,
-          aspectRatio: 0.75,
-          anchor: entry.anchor ?? null,
-          clozes: entry.clozes.map(b => ({...b, revealed: false})),
-        };
+        try {
+          const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
+          let pageCount = 0;
+          let clozeCount = 0;
+          for (const entry of Object.values(parsed)) {
+            if (entry?.clozes?.length) {
+              pageCount++;
+              clozeCount += entry.clozes.length;
+            }
+          }
+          if (pageCount > 0) {
+            summaries.push({
+              notePath: key.slice(STORAGE_PREFIX.length),
+              pageCount,
+              clozeCount,
+            });
+          }
+        } catch (e) {
+          // Corrupt entry for this note — skip it rather than fail the whole list.
+        }
       }
-      if (Object.keys(restored).length === 0) {
-        return {};
-      }
-      // In-memory state (if any already loaded this session) wins over the restored copy.
-      setPages(prev => ({...restored, ...prev}));
-      return restored;
+      summaries.sort((a, b) => a.notePath.localeCompare(b.notePath));
+      setDecks(summaries);
     } catch (e) {
-      // Corrupt or missing storage entry — just start with an empty deck.
-      return {};
+      setDecks([]);
+    } finally {
+      setDecksLoading(false);
     }
   }, []);
+
+  // Removes a note's saved clozes: best-effort cleanup of each page's off-canvas
+  // marker element (works for any note, not just the currently open one — the
+  // underlying APIs take an explicit notePath/page), then drops the storage
+  // entry. If it's the note currently open in the editor, clears live state too
+  // so the persist-on-change effect doesn't immediately write the data back.
+  const deleteDeck = useCallback(
+    async (notePath: string) => {
+      const key = storageKeyForNote(notePath);
+      try {
+        const raw = await AsyncStorage.getItem(key);
+        if (raw) {
+          const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
+          for (const [pageStr, entry] of Object.entries(parsed)) {
+            if (entry?.anchor) {
+              await deletePageAnchor(notePath, Number(pageStr), entry.anchor);
+            }
+          }
+        }
+      } catch (e) {
+        // Best effort — still remove the storage entry below regardless.
+      }
+      await AsyncStorage.removeItem(key);
+      if (notePath === notePathRef.current) {
+        setPages({});
+      }
+      setDecks(prev => prev.filter(d => d.notePath !== notePath));
+    },
+    [deletePageAnchor],
+  );
+
+  const confirmDeleteDeck = useCallback(
+    (deck: DeckSummary) => {
+      Alert.alert(
+        'Delete deck?',
+        `Remove ${deck.clozeCount} cloze${
+          deck.clozeCount === 1 ? '' : 's'
+        } across ${deck.pageCount} page${
+          deck.pageCount === 1 ? '' : 's'
+        } for "${deck.notePath.split('/').pop()}"? This can't be undone.`,
+        [
+          {text: 'Cancel', style: 'cancel'},
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: () => deleteDeck(deck.notePath),
+          },
+        ],
+      );
+    },
+    [deleteDeck],
+  );
+
+  const restorePersistedClozes = useCallback(
+    async (notePath: string): Promise<Record<number, PageState>> => {
+      try {
+        const raw = await AsyncStorage.getItem(storageKeyForNote(notePath));
+        if (!raw) {
+          return {};
+        }
+        const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
+        const restored: Record<number, PageState> = {};
+        for (const [pageStr, entry] of Object.entries(parsed)) {
+          if (
+            !entry ||
+            !Array.isArray(entry.clozes) ||
+            entry.clozes.length === 0
+          ) {
+            continue;
+          }
+          restored[Number(pageStr)] = {
+            imageUri: null,
+            aspectRatio: 0.75,
+            anchor: entry.anchor ?? null,
+            clozes: entry.clozes.map(b => ({...b, revealed: false})),
+          };
+        }
+        if (Object.keys(restored).length === 0) {
+          return {};
+        }
+        // In-memory state (if any already loaded this session) wins over the restored copy.
+        setPages(prev => ({...restored, ...prev}));
+        return restored;
+      } catch (e) {
+        // Corrupt or missing storage entry — just start with an empty deck.
+        return {};
+      }
+    },
+    [],
+  );
 
   // For every clozed page with an anchor, confirm its marker element is still at
   // that index; if not (pages reordered/inserted/deleted since), sweep the rest
@@ -347,7 +486,10 @@ function App(): React.JSX.Element {
         return;
       }
 
-      const basePages: Record<number, PageState> = {...seed, ...pagesRef.current};
+      const basePages: Record<number, PageState> = {
+        ...seed,
+        ...pagesRef.current,
+      };
       const clozedEntries = Object.entries(basePages)
         .map(([p, ps]) => [Number(p), ps] as [number, PageState])
         .filter(([, ps]) => ps.clozes.length > 0);
@@ -380,7 +522,11 @@ function App(): React.JSX.Element {
       }
 
       const claimed = new Set(confirmed);
-      const relocations: Array<{oldPage: number; newPage: number; ps: PageState}> = [];
+      const relocations: Array<{
+        oldPage: number;
+        newPage: number;
+        ps: PageState;
+      }> = [];
       for (const entry of needsRelocation) {
         const anchor = entry.ps.anchor!;
         let found: number | null = null;
@@ -395,7 +541,11 @@ function App(): React.JSX.Element {
           }
         }
         if (found !== null) {
-          relocations.push({oldPage: entry.oldPage, newPage: found, ps: entry.ps});
+          relocations.push({
+            oldPage: entry.oldPage,
+            newPage: found,
+            ps: entry.ps,
+          });
           claimed.add(found);
         }
       }
@@ -426,29 +576,23 @@ function App(): React.JSX.Element {
     [findAnchorElement],
   );
 
-  const syncCurrentPage = useCallback(async (trigger: string) => {
+  const syncCurrentPage = useCallback(async () => {
     setLoading(true);
     setError(null);
-    const runNum = ++syncRunCountRef.current;
-    const steps: string[] = [`run#${runNum}(${trigger})`];
     try {
       // The plugin host can hold a cached view of the note (e.g. page count)
       // from whenever it was first opened; structural edits made while the
       // plugin was closed/backgrounded aren't picked up until this reloads it.
-      const reloadRes: any = await PluginCommAPI.reloadFile();
-      steps.push(`reload:${reloadRes?.success ? `ok(${reloadRes.result})` : `fail(${reloadRes?.error?.code}:${reloadRes?.error?.message})`}`);
+      await PluginCommAPI.reloadFile();
 
       const fileRes: any = await PluginCommAPI.getCurrentFilePath();
       const pageRes: any = await PluginCommAPI.getCurrentPageNum();
 
       const notePath = fileRes?.result;
       const page = pageRes?.result;
-      steps.push(`file:${fileRes?.success ? notePath?.split('/').pop() : 'fail'}`);
-      steps.push(`page:${pageRes?.success ? page : 'fail'}`);
 
       if (!fileRes?.success || !notePath || typeof page !== 'number') {
         setError('Open a note page to use Cloze Quiz.');
-        setSyncDebug(steps.join(' '));
         setLoading(false);
         return;
       }
@@ -458,11 +602,10 @@ function App(): React.JSX.Element {
 
       const totalRes: any = await PluginFileAPI.getNoteTotalPageNum(notePath);
       const total =
-        totalRes?.success && typeof totalRes.result === 'number' ? totalRes.result : 1;
+        totalRes?.success && typeof totalRes.result === 'number'
+          ? totalRes.result
+          : 1;
       const totalPagesValue = Math.max(1, total);
-      steps.push(`total:${totalRes?.success ? totalPagesValue : 'fail'}`);
-      setSyncDebug(steps.join(' '));
-      console.log('[ClozeQuiz] syncCurrentPage', steps.join(' '));
       setTotalPages(totalPagesValue);
       totalPagesRef.current = totalPagesValue;
 
@@ -492,7 +635,7 @@ function App(): React.JSX.Element {
   }, [loadPageSnapshot, restorePersistedClozes, reconcilePagesByAnchor]);
 
   useEffect(() => {
-    syncCurrentPage('mount');
+    syncCurrentPage();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -500,15 +643,14 @@ function App(): React.JSX.Element {
   // first time the sidebar button is tapped — reopening it later just re-shows
   // the same instance rather than remounting, so the effect above never fires
   // again and note edits made while "closed" are never picked up automatically.
-  // `onStart`/`onStop` plugin-life events didn't reliably fire on re-open either
-  // (confirmed via the run# counter in syncDebug staying frozen across
-  // close/reopen cycles). The one signal that's guaranteed to fire every time
-  // the user (re)opens this plugin is the sidebar button press itself.
+  // `onStart`/`onStop` plugin-life events didn't reliably fire on re-open
+  // either. The one signal that's guaranteed to fire every time the user
+  // (re)opens this plugin is the sidebar button press itself.
   useEffect(() => {
     const sub = PluginManager.registerButtonListener({
       onButtonPress: (event: any) => {
         if (event?.id === CLOZE_BUTTON_ID) {
-          syncCurrentPage('button-press');
+          syncCurrentPage();
         }
       },
     });
@@ -539,7 +681,10 @@ function App(): React.JSX.Element {
         })),
       };
     }
-    AsyncStorage.setItem(storageKeyForNote(notePath), JSON.stringify(toSave)).catch(() => {});
+    AsyncStorage.setItem(
+      storageKeyForNote(notePath),
+      JSON.stringify(toSave),
+    ).catch(() => {});
   }, [pages]);
 
   const goToPage = (delta: number) => {
@@ -637,8 +782,7 @@ function App(): React.JSX.Element {
               // so it can survive reordering. Fire-and-forget; degrades silently.
               if (!hadAnchor && notePathRef.current) {
                 const notePath = notePathRef.current;
-                ensurePageAnchor(notePath, page).then(({anchor, debug}) => {
-                  setAnchorDebug(`p${page}: ${debug}`);
+                ensurePageAnchor(notePath, page).then(anchor => {
                   if (!anchor) {
                     return;
                   }
@@ -694,7 +838,9 @@ function App(): React.JSX.Element {
     }
   };
 
-  const buildQueue = (scope: QuizScope): {order: number[]; cards: QuizCard[]} => {
+  const buildQueue = (
+    scope: QuizScope,
+  ): {order: number[]; cards: QuizCard[]} => {
     const order =
       scope === 'all'
         ? Object.keys(pagesRef.current)
@@ -727,7 +873,11 @@ function App(): React.JSX.Element {
         }
         next[p] = {
           ...next[p],
-          clozes: next[p].clozes.map(c => ({...c, revealed: false, grade: 'unseen' as Grade})),
+          clozes: next[p].clozes.map(c => ({
+            ...c,
+            revealed: false,
+            grade: 'unseen' as Grade,
+          })),
         };
       }
       return next;
@@ -757,7 +907,9 @@ function App(): React.JSX.Element {
         next[p] = {
           ...next[p],
           clozes: next[p].clozes.map(c =>
-            ids.has(c.id) ? {...c, revealed: false, grade: 'unseen' as Grade} : c,
+            ids.has(c.id)
+              ? {...c, revealed: false, grade: 'unseen' as Grade}
+              : c,
           ),
         };
       }
@@ -798,7 +950,9 @@ function App(): React.JSX.Element {
         ...prev,
         [card.page]: {
           ...pg,
-          clozes: pg.clozes.map(c => (c.id === card.id ? {...c, revealed: !c.revealed} : c)),
+          clozes: pg.clozes.map(c =>
+            c.id === card.id ? {...c, revealed: !c.revealed} : c,
+          ),
         },
       };
     });
@@ -818,7 +972,9 @@ function App(): React.JSX.Element {
         ...prev,
         [card.page]: {
           ...pg,
-          clozes: pg.clozes.map(c => (c.id === card.id ? {...c, revealed: true, grade} : c)),
+          clozes: pg.clozes.map(c =>
+            c.id === card.id ? {...c, revealed: true, grade} : c,
+          ),
         },
       };
     });
@@ -843,7 +999,8 @@ function App(): React.JSX.Element {
   );
 
   const atSummary = mode === 'quiz' && quizIndex >= quizQueue.length;
-  const currentCard = mode === 'quiz' && !atSummary ? quizQueue[quizIndex] : undefined;
+  const currentCard =
+    mode === 'quiz' && !atSummary ? quizQueue[quizIndex] : undefined;
   const currentCardBox =
     currentCard && currentPageState
       ? currentPageState.clozes.find(c => c.id === currentCard.id)
@@ -871,7 +1028,9 @@ function App(): React.JSX.Element {
       ? atSummary
         ? 'Quiz Me · Done'
         : `Quiz Me · Card ${quizIndex + 1}/${quizQueue.length}`
-      : `Cloze Quiz${totalPages > 1 ? ` · Page ${currentPage + 1}/${totalPages}` : ''}`;
+      : `Cloze Quiz${
+          totalPages > 1 ? ` · Page ${currentPage + 1}/${totalPages}` : ''
+        }`;
 
   return (
     <View style={[styles.container, {backgroundColor: bg}]}>
@@ -880,304 +1039,411 @@ function App(): React.JSX.Element {
         backgroundColor={bg}
       />
 
-      <View style={styles.topBar}>
-        <Pressable style={styles.iconButton} onPress={handleClose}>
-          <Text style={[styles.iconText, {color: textColor}]}>✕</Text>
-        </Pressable>
-
-        <Text style={[styles.title, {color: textColor}]} numberOfLines={1}>
-          {title}
-        </Text>
-
-        <View style={styles.topBarActions}>
-          {mode === 'edit' ? (
-            <>
-              <TouchableOpacity
-                style={styles.pillButton}
-                onPress={clearCurrentPageClozes}
-                disabled={currentPageClozeCount === 0}>
-                <Text
-                  style={[
-                    styles.pillButtonText,
-                    currentPageClozeCount === 0 && styles.pillButtonTextDisabled,
-                  ]}>
-                  Clear
-                </Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.pillButton} onPress={() => setShuffle(s => !s)}>
-                <Text style={styles.pillButtonText}>Shuffle: {shuffle ? 'On' : 'Off'}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.pillButton} onPress={() => syncCurrentPage('refresh-button')}>
+      {screen === 'manage' ? (
+        <>
+          <View style={styles.topBar}>
+            <Pressable
+              style={styles.iconButton}
+              onPress={() => setScreen('editor')}>
+              <Text style={[styles.iconText, {color: textColor}]}>‹</Text>
+            </Pressable>
+            <Text style={[styles.title, {color: textColor}]} numberOfLines={1}>
+              Manage Decks
+            </Text>
+            <View style={styles.topBarActions}>
+              <TouchableOpacity style={styles.pillButton} onPress={loadDecks}>
                 <Text style={styles.pillButtonText}>Refresh</Text>
               </TouchableOpacity>
-            </>
-          ) : (
-            <>
-              {!atSummary && (
-                <TouchableOpacity style={styles.pillButton} onPress={resetCurrentQueue}>
-                  <Text style={styles.pillButtonText}>Reset</Text>
-                </TouchableOpacity>
-              )}
-              <TouchableOpacity style={styles.pillButton} onPress={() => setMode('edit')}>
-                <Text style={styles.pillButtonText}>Exit Quiz</Text>
-              </TouchableOpacity>
-            </>
-          )}
-        </View>
-      </View>
-
-      {mode === 'edit' && totalPages > 1 && !loading && !error && (
-        <View style={styles.pageNavRow}>
-          <TouchableOpacity
-            style={styles.pageNavButton}
-            onPress={() => goToPage(-1)}
-            disabled={currentPage === 0}>
-            <Text
-              style={[
-                styles.pageNavButtonText,
-                currentPage === 0 && styles.pillButtonTextDisabled,
-              ]}>
-              ‹ Prev Page
-            </Text>
-          </TouchableOpacity>
-          <Text style={[styles.pageNavText, {color: textColor}]}>
-            Page {currentPage + 1} / {totalPages}
-          </Text>
-          <TouchableOpacity
-            style={styles.pageNavButton}
-            onPress={() => goToPage(1)}
-            disabled={currentPage === totalPages - 1}>
-            <Text
-              style={[
-                styles.pageNavButtonText,
-                currentPage === totalPages - 1 && styles.pillButtonTextDisabled,
-              ]}>
-              Next Page ›
-            </Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {mode === 'edit' && syncDebug && (
-        <Text style={styles.debugText} numberOfLines={2}>
-          {syncDebug}
-        </Text>
-      )}
-
-      {mode === 'edit' && anchorDebug && (
-        <Text style={styles.debugText} numberOfLines={2}>
-          {anchorDebug}
-        </Text>
-      )}
-
-      {loading && (
-        <View style={styles.centerFill}>
-          <ActivityIndicator size="large" color={textColor} />
-        </View>
-      )}
-
-      {!loading && error && (
-        <View style={styles.centerFill}>
-          <Text style={[styles.errorText, {color: textColor}]}>{error}</Text>
-          <TouchableOpacity style={styles.retryButton} onPress={() => syncCurrentPage('retry-button')}>
-            <Text style={styles.retryButtonText}>Try Again</Text>
-          </TouchableOpacity>
-        </View>
-      )}
-
-      {!loading && !error && atSummary && (
-        <View style={styles.centerFill}>
-          <Text style={[styles.summaryTitle, {color: textColor}]}>Quiz complete</Text>
-          <Text style={[styles.summaryScore, {color: textColor}]}>
-            Got it: {quizStats.known} · Missed: {quizStats.missed} · Total: {quizStats.total}
-          </Text>
-        </View>
-      )}
-
-      {!loading && !error && !atSummary && currentPageState?.imageUri && (
-        <View style={styles.pageArea}>
-          <View
-            style={[styles.pageFrame, {aspectRatio: 1 / (currentPageState.aspectRatio || 0.75)}]}
-            onLayout={e => {
-              containerSize.current = {
-                width: e.nativeEvent.layout.width,
-                height: e.nativeEvent.layout.height,
-              };
-            }}
-            {...panResponder.panHandlers}>
-            <Image
-              source={{uri: currentPageState.imageUri}}
-              style={StyleSheet.absoluteFill}
-              resizeMode="contain"
-            />
-
-            {currentPageState.clozes.map(box => {
-              const style = {
-                left: `${box.x * 100}%` as const,
-                top: `${box.y * 100}%` as const,
-                width: `${box.width * 100}%` as const,
-                height: `${box.height * 100}%` as const,
-              };
-
-              if (mode === 'edit') {
-                return (
-                  <View key={box.id} style={[styles.editBox, style]}>
-                    <TouchableOpacity
-                      style={styles.deleteChip}
-                      onPress={() => removeCloze(box.id)}
-                      hitSlop={{top: 8, bottom: 8, left: 8, right: 8}}>
-                      <Text style={styles.deleteChipText}>✕</Text>
-                    </TouchableOpacity>
-                  </View>
-                );
-              }
-
-              // Quiz mode.
-              const isCurrent = currentCard?.id === box.id;
-
-              if (box.grade === 'known' || box.grade === 'missed') {
-                return (
-                  <View key={box.id} style={[styles.revealedBox, style]}>
-                    <View style={styles.gradeChip}>
-                      <Text style={styles.gradeChipText}>
-                        {box.grade === 'known' ? '✓' : '✕'}
-                      </Text>
-                    </View>
-                  </View>
-                );
-              }
-
-              if (box.revealed) {
-                // Peeked but not graded yet — only the current card can be in this state.
-                return (
-                  <TouchableOpacity
-                    key={box.id}
-                    style={[styles.revealedBox, style]}
-                    onPress={revealCurrentCard}
-                  />
-                );
-              }
-
-              if (isCurrent) {
-                return (
-                  <TouchableOpacity
-                    key={box.id}
-                    style={[styles.hiddenBox, styles.focusedHiddenBox, style]}
-                    onPress={revealCurrentCard}
-                    activeOpacity={0.85}>
-                    <Text style={styles.hiddenBoxText}>?</Text>
-                  </TouchableOpacity>
-                );
-              }
-
-              return <View key={box.id} pointerEvents="none" style={[styles.hiddenBox, style]} />;
-            })}
-
-            {mode === 'edit' && draftRect && (
-              <View
-                pointerEvents="none"
-                style={[
-                  styles.editBox,
-                  {
-                    left: draftRect.x,
-                    top: draftRect.y,
-                    width: draftRect.width,
-                    height: draftRect.height,
-                  },
-                ]}
-              />
-            )}
+            </View>
           </View>
-        </View>
-      )}
 
-      {!loading && !error && (
-        <View style={styles.bottomBar}>
-          {mode === 'edit' ? (
-            <>
-              <TouchableOpacity style={[styles.modeButton, styles.modeButtonActive]}>
-                <Text style={[styles.modeButtonText, styles.modeButtonTextActive]}>
-                  Edit Clozes
-                </Text>
-              </TouchableOpacity>
+          {decksLoading ? (
+            <View style={styles.centerFill}>
+              <ActivityIndicator size="large" color={textColor} />
+            </View>
+          ) : decks.length === 0 ? (
+            <View style={styles.centerFill}>
+              <Text style={[styles.errorText, {color: textColor}]}>
+                No saved decks yet.
+              </Text>
+            </View>
+          ) : (
+            <ScrollView contentContainerStyle={styles.deckListContent}>
+              {decks.map(deck => (
+                <View key={deck.notePath} style={styles.deckRow}>
+                  <View style={styles.deckInfo}>
+                    <Text
+                      style={[styles.deckName, {color: textColor}]}
+                      numberOfLines={1}>
+                      {deck.notePath.split('/').pop()}
+                    </Text>
+                    <Text style={styles.deckMeta}>
+                      {deck.pageCount} page{deck.pageCount === 1 ? '' : 's'} ·{' '}
+                      {deck.clozeCount} cloze{deck.clozeCount === 1 ? '' : 's'}
+                      {deck.notePath === notePathRef.current
+                        ? ' · current note'
+                        : ''}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.deckDeleteButton}
+                    onPress={() => confirmDeleteDeck(deck)}>
+                    <Text style={styles.deckDeleteButtonText}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </ScrollView>
+          )}
+        </>
+      ) : (
+        <>
+          <View style={styles.topBar}>
+            <Pressable style={styles.iconButton} onPress={handleClose}>
+              <Text style={[styles.iconText, {color: textColor}]}>✕</Text>
+            </Pressable>
+
+            <Text style={[styles.title, {color: textColor}]} numberOfLines={1}>
+              {title}
+            </Text>
+
+            <View style={styles.topBarActions}>
+              {mode === 'edit' ? (
+                <>
+                  <TouchableOpacity
+                    style={styles.pillButton}
+                    onPress={() => {
+                      setScreen('manage');
+                      loadDecks();
+                    }}>
+                    <Text style={styles.pillButtonText}>Decks</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.pillButton}
+                    onPress={clearCurrentPageClozes}
+                    disabled={currentPageClozeCount === 0}>
+                    <Text
+                      style={[
+                        styles.pillButtonText,
+                        currentPageClozeCount === 0 &&
+                          styles.pillButtonTextDisabled,
+                      ]}>
+                      Clear
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.pillButton}
+                    onPress={() => setShuffle(s => !s)}>
+                    <Text style={styles.pillButtonText}>
+                      Shuffle: {shuffle ? 'On' : 'Off'}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.pillButton}
+                    onPress={() => syncCurrentPage()}>
+                    <Text style={styles.pillButtonText}>Refresh</Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <>
+                  {!atSummary && (
+                    <TouchableOpacity
+                      style={styles.pillButton}
+                      onPress={resetCurrentQueue}>
+                      <Text style={styles.pillButtonText}>Reset</Text>
+                    </TouchableOpacity>
+                  )}
+                  <TouchableOpacity
+                    style={styles.pillButton}
+                    onPress={() => setMode('edit')}>
+                    <Text style={styles.pillButtonText}>Exit Quiz</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+            </View>
+          </View>
+
+          {mode === 'edit' && totalPages > 1 && !loading && !error && (
+            <View style={styles.pageNavRow}>
               <TouchableOpacity
-                style={styles.modeButton}
-                onPress={() => startQuiz('page')}
-                disabled={currentPageClozeCount === 0}>
+                style={styles.pageNavButton}
+                onPress={() => goToPage(-1)}
+                disabled={currentPage === 0}>
                 <Text
                   style={[
-                    styles.modeButtonText,
-                    currentPageClozeCount === 0 && styles.modeButtonTextDisabled,
+                    styles.pageNavButtonText,
+                    currentPage === 0 && styles.pillButtonTextDisabled,
                   ]}>
-                  Quiz Me{currentPageClozeCount > 0 ? ` (${currentPageClozeCount})` : ''}
+                  ‹ Prev Page
                 </Text>
               </TouchableOpacity>
-              {otherPagesHaveClozes && (
-                <TouchableOpacity style={styles.modeButton} onPress={() => startQuiz('all')}>
-                  <Text style={styles.modeButtonText}>
-                    Quiz All Pages ({totalClozesAllPages})
-                  </Text>
-                </TouchableOpacity>
-              )}
-            </>
-          ) : atSummary ? (
-            <>
-              <TouchableOpacity style={styles.modeButton} onPress={restartQuiz}>
-                <Text style={styles.modeButtonText}>Restart</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.modeButton} onPress={() => setMode('edit')}>
-                <Text style={styles.modeButtonText}>Back to Edit</Text>
-              </TouchableOpacity>
-            </>
-          ) : (
-            <View style={styles.quizControls}>
-              <View style={styles.quizStatsRow}>
-                <Text style={[styles.quizStatsText, {color: textColor}]}>
-                  ✓ {quizStats.known} · ✕ {quizStats.missed} · left{' '}
-                  {quizStats.total - quizStats.known - quizStats.missed}
+              <Text style={[styles.pageNavText, {color: textColor}]}>
+                Page {currentPage + 1} / {totalPages}
+              </Text>
+              <TouchableOpacity
+                style={styles.pageNavButton}
+                onPress={() => goToPage(1)}
+                disabled={currentPage === totalPages - 1}>
+                <Text
+                  style={[
+                    styles.pageNavButtonText,
+                    currentPage === totalPages - 1 &&
+                      styles.pillButtonTextDisabled,
+                  ]}>
+                  Next Page ›
                 </Text>
-              </View>
-              <View style={styles.quizButtonsRow}>
-                <TouchableOpacity
-                  style={styles.modeButton}
-                  onPress={goPrevCard}
-                  disabled={quizIndex === 0}>
-                  <Text
-                    style={[
-                      styles.modeButtonText,
-                      quizIndex === 0 && styles.modeButtonTextDisabled,
-                    ]}>
-                    ‹ Prev
-                  </Text>
-                </TouchableOpacity>
+              </TouchableOpacity>
+            </View>
+          )}
 
-                {currentCardBox?.revealed ? (
-                  <>
-                    <TouchableOpacity
-                      style={styles.modeButton}
-                      onPress={() => gradeCurrentCard('missed')}>
-                      <Text style={styles.modeButtonText}>Missed it</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={styles.modeButton}
-                      onPress={() => gradeCurrentCard('known')}>
-                      <Text style={styles.modeButtonText}>Got it</Text>
-                    </TouchableOpacity>
-                  </>
-                ) : (
-                  <>
-                    <TouchableOpacity style={styles.modeButton} onPress={revealCurrentCard}>
-                      <Text style={styles.modeButtonText}>Reveal</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={styles.modeButton} onPress={goNextCard}>
-                      <Text style={styles.modeButtonText}>Skip ›</Text>
-                    </TouchableOpacity>
-                  </>
+          {loading && (
+            <View style={styles.centerFill}>
+              <ActivityIndicator size="large" color={textColor} />
+            </View>
+          )}
+
+          {!loading && error && (
+            <View style={styles.centerFill}>
+              <Text style={[styles.errorText, {color: textColor}]}>
+                {error}
+              </Text>
+              <TouchableOpacity
+                style={styles.retryButton}
+                onPress={() => syncCurrentPage()}>
+                <Text style={styles.retryButtonText}>Try Again</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {!loading && !error && atSummary && (
+            <View style={styles.centerFill}>
+              <Text style={[styles.summaryTitle, {color: textColor}]}>
+                Quiz complete
+              </Text>
+              <Text style={[styles.summaryScore, {color: textColor}]}>
+                Got it: {quizStats.known} · Missed: {quizStats.missed} · Total:{' '}
+                {quizStats.total}
+              </Text>
+            </View>
+          )}
+
+          {!loading && !error && !atSummary && currentPageState?.imageUri && (
+            <View style={styles.pageArea}>
+              <View
+                style={[
+                  styles.pageFrame,
+                  {aspectRatio: 1 / (currentPageState.aspectRatio || 0.75)},
+                ]}
+                onLayout={e => {
+                  containerSize.current = {
+                    width: e.nativeEvent.layout.width,
+                    height: e.nativeEvent.layout.height,
+                  };
+                }}
+                {...panResponder.panHandlers}>
+                <Image
+                  source={{uri: currentPageState.imageUri}}
+                  style={StyleSheet.absoluteFill}
+                  resizeMode="contain"
+                />
+
+                {currentPageState.clozes.map(box => {
+                  const style = {
+                    left: `${box.x * 100}%` as const,
+                    top: `${box.y * 100}%` as const,
+                    width: `${box.width * 100}%` as const,
+                    height: `${box.height * 100}%` as const,
+                  };
+
+                  if (mode === 'edit') {
+                    return (
+                      <View key={box.id} style={[styles.editBox, style]}>
+                        <TouchableOpacity
+                          style={styles.deleteChip}
+                          onPress={() => removeCloze(box.id)}
+                          hitSlop={{top: 8, bottom: 8, left: 8, right: 8}}>
+                          <Text style={styles.deleteChipText}>✕</Text>
+                        </TouchableOpacity>
+                      </View>
+                    );
+                  }
+
+                  // Quiz mode.
+                  const isCurrent = currentCard?.id === box.id;
+
+                  if (box.grade === 'known' || box.grade === 'missed') {
+                    return (
+                      <View key={box.id} style={[styles.revealedBox, style]}>
+                        <View style={styles.gradeChip}>
+                          <Text style={styles.gradeChipText}>
+                            {box.grade === 'known' ? '✓' : '✕'}
+                          </Text>
+                        </View>
+                      </View>
+                    );
+                  }
+
+                  if (box.revealed) {
+                    // Peeked but not graded yet — only the current card can be in this state.
+                    return (
+                      <TouchableOpacity
+                        key={box.id}
+                        style={[styles.revealedBox, style]}
+                        onPress={revealCurrentCard}
+                      />
+                    );
+                  }
+
+                  if (isCurrent) {
+                    return (
+                      <TouchableOpacity
+                        key={box.id}
+                        style={[
+                          styles.hiddenBox,
+                          styles.focusedHiddenBox,
+                          style,
+                        ]}
+                        onPress={revealCurrentCard}
+                        activeOpacity={0.85}>
+                        <Text style={styles.hiddenBoxText}>?</Text>
+                      </TouchableOpacity>
+                    );
+                  }
+
+                  return (
+                    <View
+                      key={box.id}
+                      pointerEvents="none"
+                      style={[styles.hiddenBox, style]}
+                    />
+                  );
+                })}
+
+                {mode === 'edit' && draftRect && (
+                  <View
+                    pointerEvents="none"
+                    style={[
+                      styles.editBox,
+                      {
+                        left: draftRect.x,
+                        top: draftRect.y,
+                        width: draftRect.width,
+                        height: draftRect.height,
+                      },
+                    ]}
+                  />
                 )}
               </View>
             </View>
           )}
-        </View>
+
+          {!loading && !error && (
+            <View style={styles.bottomBar}>
+              {mode === 'edit' ? (
+                <>
+                  <TouchableOpacity
+                    style={[styles.modeButton, styles.modeButtonActive]}>
+                    <Text
+                      style={[
+                        styles.modeButtonText,
+                        styles.modeButtonTextActive,
+                      ]}>
+                      Edit Clozes
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.modeButton}
+                    onPress={() => startQuiz('page')}
+                    disabled={currentPageClozeCount === 0}>
+                    <Text
+                      style={[
+                        styles.modeButtonText,
+                        currentPageClozeCount === 0 &&
+                          styles.modeButtonTextDisabled,
+                      ]}>
+                      Quiz Me
+                      {currentPageClozeCount > 0
+                        ? ` (${currentPageClozeCount})`
+                        : ''}
+                    </Text>
+                  </TouchableOpacity>
+                  {otherPagesHaveClozes && (
+                    <TouchableOpacity
+                      style={styles.modeButton}
+                      onPress={() => startQuiz('all')}>
+                      <Text style={styles.modeButtonText}>
+                        Quiz All Pages ({totalClozesAllPages})
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </>
+              ) : atSummary ? (
+                <>
+                  <TouchableOpacity
+                    style={styles.modeButton}
+                    onPress={restartQuiz}>
+                    <Text style={styles.modeButtonText}>Restart</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.modeButton}
+                    onPress={() => setMode('edit')}>
+                    <Text style={styles.modeButtonText}>Back to Edit</Text>
+                  </TouchableOpacity>
+                </>
+              ) : (
+                <View style={styles.quizControls}>
+                  <View style={styles.quizStatsRow}>
+                    <Text style={[styles.quizStatsText, {color: textColor}]}>
+                      ✓ {quizStats.known} · ✕ {quizStats.missed} · left{' '}
+                      {quizStats.total - quizStats.known - quizStats.missed}
+                    </Text>
+                  </View>
+                  <View style={styles.quizButtonsRow}>
+                    <TouchableOpacity
+                      style={styles.modeButton}
+                      onPress={goPrevCard}
+                      disabled={quizIndex === 0}>
+                      <Text
+                        style={[
+                          styles.modeButtonText,
+                          quizIndex === 0 && styles.modeButtonTextDisabled,
+                        ]}>
+                        ‹ Prev
+                      </Text>
+                    </TouchableOpacity>
+
+                    {currentCardBox?.revealed ? (
+                      <>
+                        <TouchableOpacity
+                          style={styles.modeButton}
+                          onPress={() => gradeCurrentCard('missed')}>
+                          <Text style={styles.modeButtonText}>Missed it</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.modeButton}
+                          onPress={() => gradeCurrentCard('known')}>
+                          <Text style={styles.modeButtonText}>Got it</Text>
+                        </TouchableOpacity>
+                      </>
+                    ) : (
+                      <>
+                        <TouchableOpacity
+                          style={styles.modeButton}
+                          onPress={revealCurrentCard}>
+                          <Text style={styles.modeButtonText}>Reveal</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          style={styles.modeButton}
+                          onPress={goNextCard}>
+                          <Text style={styles.modeButtonText}>Skip ›</Text>
+                        </TouchableOpacity>
+                      </>
+                    )}
+                  </View>
+                </View>
+              )}
+            </View>
+          )}
+        </>
       )}
     </View>
   );
@@ -1248,12 +1514,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginHorizontal: 10,
   },
-  debugText: {
-    fontSize: 10,
-    color: '#888888',
-    paddingHorizontal: 12,
-    paddingBottom: 6,
-  },
   centerFill: {
     flex: 1,
     alignItems: 'center',
@@ -1264,6 +1524,44 @@ const styles = StyleSheet.create({
     fontSize: 15,
     textAlign: 'center',
     marginBottom: 16,
+  },
+  deckListContent: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  deckRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: '#000000',
+    borderRadius: 12,
+    marginBottom: 10,
+  },
+  deckInfo: {
+    flex: 1,
+    marginRight: 10,
+  },
+  deckName: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  deckMeta: {
+    fontSize: 12,
+    color: '#888888',
+    marginTop: 2,
+  },
+  deckDeleteButton: {
+    borderWidth: 1,
+    borderColor: '#000000',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  deckDeleteButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
   },
   retryButton: {
     borderWidth: 1,
