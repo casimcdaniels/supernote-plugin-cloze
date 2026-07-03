@@ -28,7 +28,7 @@ import {
   View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
+import {Element, PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 
 type Mode = 'edit' | 'quiz';
 type Grade = 'unseen' | 'known' | 'missed';
@@ -45,10 +45,24 @@ interface ClozeBox {
   grade: Grade;
 }
 
+interface PageAnchor {
+  // Unique marker string embedded as the content of a tiny text element we plant
+  // just off-canvas past the page's bottom-right corner. It's self-labeled
+  // ("CLOZE:xxxx") rather than relying on the native-assigned element uuid, so
+  // it reads as an obvious, harmless plugin artifact if it's ever spotted
+  // (e.g. if the off-canvas assumption turns out wrong), not a stray mark.
+  token: string;
+}
+
 interface PageState {
   imageUri: string | null;
   aspectRatio: number;
   clozes: ClozeBox[];
+  // Content-anchored "page ID" so clozes can be relocated if the note's pages
+  // get reordered/inserted/deleted — the SDK only exposes a plain 0-based page
+  // index, never a stable page ID. Null if planting the marker failed (falls
+  // back to trusting the index for that page).
+  anchor: PageAnchor | null;
 }
 
 interface DraftRect {
@@ -64,12 +78,27 @@ interface QuizCard {
 }
 
 type PersistedClozeBox = Pick<ClozeBox, 'id' | 'x' | 'y' | 'width' | 'height' | 'grade'>;
+interface PersistedPageEntry {
+  anchor: PageAnchor | null;
+  clozes: PersistedClozeBox[];
+}
 
 const MIN_BOX_PX = 14;
-const STORAGE_PREFIX = 'clozequiz:v1:';
+// Must match the sidebar button's id in index.js's PluginManager.registerButton call.
+const CLOZE_BUTTON_ID = 100;
+const STORAGE_PREFIX = 'clozequiz:v3:';
+const ANCHOR_TOKEN_PREFIX = 'CLOZE:';
+// Marker size, and how far past the page's actual pixel bounds to plant it
+// (bottom-right corner, just off-canvas), in page pixels.
+const ANCHOR_MARGIN = 20;
+const ANCHOR_SIZE = 40;
 
 function storageKeyForNote(notePath: string): string {
   return `${STORAGE_PREFIX}${notePath}`;
+}
+
+function newAnchorToken(): string {
+  return `${ANCHOR_TOKEN_PREFIX}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function shuffleArray<T>(items: T[]): T[] {
@@ -92,6 +121,8 @@ function App(): React.JSX.Element {
 
   const [mode, setMode] = useState<Mode>('edit');
   const [shuffle, setShuffle] = useState(false);
+  const [anchorDebug, setAnchorDebug] = useState<string | null>(null);
+  const [syncDebug, setSyncDebug] = useState<string | null>(null);
   const [draftRect, setDraftRect] = useState<DraftRect | null>(null);
 
   const [quizScope, setQuizScope] = useState<QuizScope>('page');
@@ -107,6 +138,9 @@ function App(): React.JSX.Element {
   pagesRef.current = pages;
   const currentPageRef = useRef(currentPage);
   currentPageRef.current = currentPage;
+  const totalPagesRef = useRef(totalPages);
+  totalPagesRef.current = totalPages;
+  const syncRunCountRef = useRef(0);
 
   const handleClose = () => {
     PluginManager.closePluginView();
@@ -150,7 +184,7 @@ function App(): React.JSX.Element {
       }
 
       setPages(prev => {
-        const existing = prev[page] ?? {imageUri: null, aspectRatio, clozes: []};
+        const existing = prev[page] ?? {imageUri: null, aspectRatio, clozes: [], anchor: null};
         return {
           ...prev,
           [page]: {...existing, imageUri: `file://${pngPath}`, aspectRatio},
@@ -161,46 +195,260 @@ function App(): React.JSX.Element {
     }
   }, []);
 
-  const restorePersistedClozes = useCallback(async (notePath: string) => {
+  // Finds our marker text element on a page by its token, if one exists there.
+  const findAnchorElement = useCallback(
+    async (notePath: string, page: number, token: string): Promise<{num: number} | null> => {
+      try {
+        const res: any = await PluginFileAPI.getElements(page, notePath);
+        const elements = res?.success ? res.result : null;
+        if (!Array.isArray(elements)) {
+          return null;
+        }
+        const match = elements.find(
+          (el: any) => el?.type === Element.TYPE_TEXT && el?.textBox?.textContentFull === token,
+        );
+        if (!match) {
+          return null;
+        }
+        return {num: match.numInPage};
+      } catch (e) {
+        return null;
+      }
+    },
+    [],
+  );
+
+  // Best-effort: plant a tiny, self-labeled text marker ("CLOZE:xxxx") just past
+  // the page's bottom-right corner (off-canvas — outside the page's actual pixel
+  // bounds, so it shouldn't render or be reachable by lasso/select-all), and use
+  // its own content as a stable "page ID". Degrades to null (index-trust only)
+  // if any step fails — never throws, since this must not be able to break
+  // editing/studying.
+  //
+  // Uses PluginCommAPI.createElement + PluginFileAPI.insertElements (the
+  // officially-documented pattern — a hand-built plain object literal was
+  // rejected natively) rather than PluginNoteAPI.insertText, because insertText
+  // has no notePath/page params: per the docs it only affects whatever page is
+  // actually on-screen in the live note, which can differ from `page` here
+  // since our own Prev/Next Page buttons browse independently of the live note.
+  // insertElements takes an explicit page, so this works for any page.
+  const ensurePageAnchor = useCallback(
+    async (notePath: string, page: number): Promise<{anchor: PageAnchor | null; debug: string}> => {
+      const steps: string[] = [];
+      try {
+        const sizeRes: any = await PluginFileAPI.getPageSize(notePath, page);
+        steps.push(
+          `size:${sizeRes?.success ? `ok(${sizeRes.result?.width}x${sizeRes.result?.height})` : `fail(${sizeRes?.error?.message ?? sizeRes?.error?.code})`}`,
+        );
+        if (!sizeRes?.success || !sizeRes.result?.width || !sizeRes.result?.height) {
+          return {anchor: null, debug: steps.join(' ')};
+        }
+        const left = sizeRes.result.width + ANCHOR_MARGIN;
+        const top = sizeRes.result.height + ANCHOR_MARGIN;
+        const token = newAnchorToken();
+
+        const createRes: any = await PluginCommAPI.createElement(Element.TYPE_TEXT);
+        steps.push(
+          `create:${createRes?.success ? 'ok' : `fail(${createRes?.error?.code}:${createRes?.error?.message})`}`,
+        );
+        if (!createRes?.success || !createRes?.result) {
+          return {anchor: null, debug: steps.join(' ')};
+        }
+
+        const element = createRes.result;
+        element.layerNum = 0;
+        element.textBox = {
+          ...(element.textBox ?? {}),
+          textContentFull: token,
+          textRect: {left, top, right: left + ANCHOR_SIZE, bottom: top + ANCHOR_SIZE},
+          fontSize: 8,
+          textAlign: 0,
+          textBold: 0,
+          textItalics: 0,
+          textFrameWidthType: 0,
+          textFrameStyle: 0,
+          textEditable: 1, // 0=editable, 1=non-editable per the docs
+        };
+
+        const insertRes: any = await PluginFileAPI.insertElements(notePath, page, [element]);
+        steps.push(
+          `insert:${insertRes?.success ? `ok(${insertRes.result})` : `fail(${insertRes?.error?.code}:${insertRes?.error?.message})`}`,
+        );
+        console.log('[ClozeQuiz] ensurePageAnchor insert response', JSON.stringify(insertRes));
+        if (!insertRes?.success || !insertRes?.result) {
+          return {anchor: null, debug: steps.join(' ')};
+        }
+
+        const found = await findAnchorElement(notePath, page, token);
+        steps.push(`verify:${found ? 'ok' : 'not-found'}`);
+        if (!found) {
+          return {anchor: null, debug: steps.join(' ')};
+        }
+        return {anchor: {token}, debug: steps.join(' ')};
+      } catch (e) {
+        steps.push(`error:${(e as Error)?.message ?? String(e)}`);
+        return {anchor: null, debug: steps.join(' ')};
+      }
+    },
+    [findAnchorElement],
+  );
+
+  // Best-effort: remove the marker element once a page's deck is cleared.
+  const deletePageAnchor = useCallback(async (notePath: string, page: number, anchor: PageAnchor) => {
+    try {
+      const found = await findAnchorElement(notePath, page, anchor.token);
+      if (found) {
+        await PluginFileAPI.deleteElements(notePath, page, [found.num]);
+      }
+    } catch (e) {
+      // Nothing more we can do — worst case a stray marker lingers in the corner.
+    }
+  }, [findAnchorElement]);
+
+  const restorePersistedClozes = useCallback(async (notePath: string): Promise<Record<number, PageState>> => {
     try {
       const raw = await AsyncStorage.getItem(storageKeyForNote(notePath));
       if (!raw) {
-        return;
+        return {};
       }
-      const parsed = JSON.parse(raw) as Record<string, PersistedClozeBox[]>;
+      const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
       const restored: Record<number, PageState> = {};
-      for (const [pageStr, boxes] of Object.entries(parsed)) {
-        if (!Array.isArray(boxes) || boxes.length === 0) {
+      for (const [pageStr, entry] of Object.entries(parsed)) {
+        if (!entry || !Array.isArray(entry.clozes) || entry.clozes.length === 0) {
           continue;
         }
         restored[Number(pageStr)] = {
           imageUri: null,
           aspectRatio: 0.75,
-          clozes: boxes.map(b => ({...b, revealed: false})),
+          anchor: entry.anchor ?? null,
+          clozes: entry.clozes.map(b => ({...b, revealed: false})),
         };
       }
       if (Object.keys(restored).length === 0) {
-        return;
+        return {};
       }
       // In-memory state (if any already loaded this session) wins over the restored copy.
       setPages(prev => ({...restored, ...prev}));
+      return restored;
     } catch (e) {
       // Corrupt or missing storage entry — just start with an empty deck.
+      return {};
     }
   }, []);
 
-  const syncCurrentPage = useCallback(async () => {
+  // For every clozed page with an anchor, confirm its marker element is still at
+  // that index; if not (pages reordered/inserted/deleted since), sweep the rest
+  // of the note for it and relocate the clozes. Pages without an anchor (no free
+  // layer slot when first clozed) are left as-is — index is all we have for them.
+  const reconcilePagesByAnchor = useCallback(
+    async (seed: Record<number, PageState>) => {
+      const notePath = notePathRef.current;
+      if (!notePath) {
+        return;
+      }
+
+      const basePages: Record<number, PageState> = {...seed, ...pagesRef.current};
+      const clozedEntries = Object.entries(basePages)
+        .map(([p, ps]) => [Number(p), ps] as [number, PageState])
+        .filter(([, ps]) => ps.clozes.length > 0);
+      if (clozedEntries.length === 0) {
+        return;
+      }
+
+      const needsRelocation: Array<{oldPage: number; ps: PageState}> = [];
+      const confirmed = new Set<number>();
+
+      for (const [page, ps] of clozedEntries) {
+        if (!ps.anchor) {
+          confirmed.add(page); // Nothing to check against — trust the index.
+          continue;
+        }
+        if (page >= totalPagesRef.current) {
+          needsRelocation.push({oldPage: page, ps});
+          continue;
+        }
+        const found = await findAnchorElement(notePath, page, ps.anchor.token);
+        if (found) {
+          confirmed.add(page);
+        } else {
+          needsRelocation.push({oldPage: page, ps});
+        }
+      }
+
+      if (needsRelocation.length === 0) {
+        return;
+      }
+
+      const claimed = new Set(confirmed);
+      const relocations: Array<{oldPage: number; newPage: number; ps: PageState}> = [];
+      for (const entry of needsRelocation) {
+        const anchor = entry.ps.anchor!;
+        let found: number | null = null;
+        for (let p = 0; p < totalPagesRef.current; p++) {
+          if (claimed.has(p) || relocations.some(r => r.newPage === p)) {
+            continue;
+          }
+          const match = await findAnchorElement(notePath, p, anchor.token);
+          if (match) {
+            found = p;
+            break;
+          }
+        }
+        if (found !== null) {
+          relocations.push({oldPage: entry.oldPage, newPage: found, ps: entry.ps});
+          claimed.add(found);
+        }
+      }
+
+      if (relocations.length === 0) {
+        return;
+      }
+
+      setPages(prev => {
+        const next = {...prev};
+        for (const {oldPage} of needsRelocation) {
+          if (next[oldPage]) {
+            next[oldPage] = {...next[oldPage], clozes: [], anchor: null};
+          }
+        }
+        for (const {newPage, ps} of relocations) {
+          const existingImage = next[newPage];
+          next[newPage] = {
+            imageUri: existingImage?.imageUri ?? null,
+            aspectRatio: existingImage?.aspectRatio ?? ps.aspectRatio,
+            clozes: ps.clozes,
+            anchor: ps.anchor,
+          };
+        }
+        return next;
+      });
+    },
+    [findAnchorElement],
+  );
+
+  const syncCurrentPage = useCallback(async (trigger: string) => {
     setLoading(true);
     setError(null);
+    const runNum = ++syncRunCountRef.current;
+    const steps: string[] = [`run#${runNum}(${trigger})`];
     try {
+      // The plugin host can hold a cached view of the note (e.g. page count)
+      // from whenever it was first opened; structural edits made while the
+      // plugin was closed/backgrounded aren't picked up until this reloads it.
+      const reloadRes: any = await PluginCommAPI.reloadFile();
+      steps.push(`reload:${reloadRes?.success ? `ok(${reloadRes.result})` : `fail(${reloadRes?.error?.code}:${reloadRes?.error?.message})`}`);
+
       const fileRes: any = await PluginCommAPI.getCurrentFilePath();
       const pageRes: any = await PluginCommAPI.getCurrentPageNum();
 
       const notePath = fileRes?.result;
       const page = pageRes?.result;
+      steps.push(`file:${fileRes?.success ? notePath?.split('/').pop() : 'fail'}`);
+      steps.push(`page:${pageRes?.success ? page : 'fail'}`);
 
       if (!fileRes?.success || !notePath || typeof page !== 'number') {
         setError('Open a note page to use Cloze Quiz.');
+        setSyncDebug(steps.join(' '));
         setLoading(false);
         return;
       }
@@ -211,19 +459,60 @@ function App(): React.JSX.Element {
       const totalRes: any = await PluginFileAPI.getNoteTotalPageNum(notePath);
       const total =
         totalRes?.success && typeof totalRes.result === 'number' ? totalRes.result : 1;
-      setTotalPages(Math.max(1, total));
+      const totalPagesValue = Math.max(1, total);
+      steps.push(`total:${totalRes?.success ? totalPagesValue : 'fail'}`);
+      setSyncDebug(steps.join(' '));
+      console.log('[ClozeQuiz] syncCurrentPage', steps.join(' '));
+      setTotalPages(totalPagesValue);
+      totalPagesRef.current = totalPagesValue;
 
-      await restorePersistedClozes(notePath);
+      // Any cached page snapshot could now belong to different content — pages
+      // may have been inserted/deleted/reordered in the note since we last
+      // looked (e.g. the plugin's JS context surviving a close+reopen without a
+      // fresh mount). Drop every cached image so revisited pages re-render from
+      // scratch instead of showing stale content under the wrong index. Clozes
+      // aren't touched here — reconcilePagesByAnchor below handles relocating
+      // those independently via each page's own anchor marker.
+      setPages(prev => {
+        const next: Record<number, PageState> = {};
+        for (const [pStr, ps] of Object.entries(prev)) {
+          next[Number(pStr)] = {...ps, imageUri: null};
+        }
+        return next;
+      });
+
+      const restored = await restorePersistedClozes(notePath);
+      await reconcilePagesByAnchor(restored);
       await loadPageSnapshot(page, true);
     } catch (e) {
       setError('Something went wrong loading the page.');
     } finally {
       setLoading(false);
     }
-  }, [loadPageSnapshot, restorePersistedClozes]);
+  }, [loadPageSnapshot, restorePersistedClozes, reconcilePagesByAnchor]);
 
   useEffect(() => {
-    syncCurrentPage();
+    syncCurrentPage('mount');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // The plugin's JS context/React tree appears to only ever mount once, the
+  // first time the sidebar button is tapped — reopening it later just re-shows
+  // the same instance rather than remounting, so the effect above never fires
+  // again and note edits made while "closed" are never picked up automatically.
+  // `onStart`/`onStop` plugin-life events didn't reliably fire on re-open either
+  // (confirmed via the run# counter in syncDebug staying frozen across
+  // close/reopen cycles). The one signal that's guaranteed to fire every time
+  // the user (re)opens this plugin is the sidebar button press itself.
+  useEffect(() => {
+    const sub = PluginManager.registerButtonListener({
+      onButtonPress: (event: any) => {
+        if (event?.id === CLOZE_BUTTON_ID) {
+          syncCurrentPage('button-press');
+        }
+      },
+    });
+    return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -233,19 +522,22 @@ function App(): React.JSX.Element {
     if (!notePath) {
       return;
     }
-    const toSave: Record<number, PersistedClozeBox[]> = {};
+    const toSave: Record<number, PersistedPageEntry> = {};
     for (const [pageStr, ps] of Object.entries(pages)) {
       if (ps.clozes.length === 0) {
         continue;
       }
-      toSave[Number(pageStr)] = ps.clozes.map(({id, x, y, width, height, grade}) => ({
-        id,
-        x,
-        y,
-        width,
-        height,
-        grade,
-      }));
+      toSave[Number(pageStr)] = {
+        anchor: ps.anchor,
+        clozes: ps.clozes.map(({id, x, y, width, height, grade}) => ({
+          id,
+          x,
+          y,
+          width,
+          height,
+          grade,
+        })),
+      };
     }
     AsyncStorage.setItem(storageKeyForNote(notePath), JSON.stringify(toSave)).catch(() => {});
   }, [pages]);
@@ -327,45 +619,79 @@ function App(): React.JSX.Element {
                 grade: 'unseen',
               };
               const page = currentPageRef.current;
+              let hadAnchor = false;
               setPages(prevPages => {
                 const existing = prevPages[page] ?? {
                   imageUri: null,
                   aspectRatio: 0.75,
                   clozes: [],
+                  anchor: null,
                 };
+                hadAnchor = !!existing.anchor;
                 return {
                   ...prevPages,
                   [page]: {...existing, clozes: [...existing.clozes, box]},
                 };
               });
+              // First cloze on this page this session — try to plant a page anchor
+              // so it can survive reordering. Fire-and-forget; degrades silently.
+              if (!hadAnchor && notePathRef.current) {
+                const notePath = notePathRef.current;
+                ensurePageAnchor(notePath, page).then(({anchor, debug}) => {
+                  setAnchorDebug(`p${page}: ${debug}`);
+                  if (!anchor) {
+                    return;
+                  }
+                  setPages(prevPages => {
+                    const existing = prevPages[page];
+                    if (!existing || existing.anchor) {
+                      return prevPages;
+                    }
+                    return {...prevPages, [page]: {...existing, anchor}};
+                  });
+                });
+              }
             }
             return null;
           });
         },
       }),
-    [mode],
+    [mode, ensurePageAnchor],
   );
 
   const removeCloze = (id: string) => {
     const page = currentPage;
+    let clearedAnchor: PageAnchor | null = null;
     setPages(prev => {
       const existing = prev[page];
       if (!existing) {
         return prev;
       }
-      return {...prev, [page]: {...existing, clozes: existing.clozes.filter(c => c.id !== id)}};
+      const clozes = existing.clozes.filter(c => c.id !== id);
+      const anchorCleared = clozes.length === 0 ? null : existing.anchor;
+      if (clozes.length === 0 && existing.anchor) {
+        clearedAnchor = existing.anchor;
+      }
+      return {...prev, [page]: {...existing, clozes, anchor: anchorCleared}};
     });
+    if (clearedAnchor && notePathRef.current) {
+      deletePageAnchor(notePathRef.current, page, clearedAnchor);
+    }
   };
 
   const clearCurrentPageClozes = () => {
     const page = currentPage;
+    const anchor = pagesRef.current[page]?.anchor ?? null;
     setPages(prev => {
       const existing = prev[page];
       if (!existing) {
         return prev;
       }
-      return {...prev, [page]: {...existing, clozes: []}};
+      return {...prev, [page]: {...existing, clozes: [], anchor: null}};
     });
+    if (anchor && notePathRef.current) {
+      deletePageAnchor(notePathRef.current, page, anchor);
+    }
   };
 
   const buildQueue = (scope: QuizScope): {order: number[]; cards: QuizCard[]} => {
@@ -581,7 +907,7 @@ function App(): React.JSX.Element {
               <TouchableOpacity style={styles.pillButton} onPress={() => setShuffle(s => !s)}>
                 <Text style={styles.pillButtonText}>Shuffle: {shuffle ? 'On' : 'Off'}</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={styles.pillButton} onPress={syncCurrentPage}>
+              <TouchableOpacity style={styles.pillButton} onPress={() => syncCurrentPage('refresh-button')}>
                 <Text style={styles.pillButtonText}>Refresh</Text>
               </TouchableOpacity>
             </>
@@ -632,6 +958,18 @@ function App(): React.JSX.Element {
         </View>
       )}
 
+      {mode === 'edit' && syncDebug && (
+        <Text style={styles.debugText} numberOfLines={2}>
+          {syncDebug}
+        </Text>
+      )}
+
+      {mode === 'edit' && anchorDebug && (
+        <Text style={styles.debugText} numberOfLines={2}>
+          {anchorDebug}
+        </Text>
+      )}
+
       {loading && (
         <View style={styles.centerFill}>
           <ActivityIndicator size="large" color={textColor} />
@@ -641,7 +979,7 @@ function App(): React.JSX.Element {
       {!loading && error && (
         <View style={styles.centerFill}>
           <Text style={[styles.errorText, {color: textColor}]}>{error}</Text>
-          <TouchableOpacity style={styles.retryButton} onPress={syncCurrentPage}>
+          <TouchableOpacity style={styles.retryButton} onPress={() => syncCurrentPage('retry-button')}>
             <Text style={styles.retryButtonText}>Try Again</Text>
           </TouchableOpacity>
         </View>
@@ -909,6 +1247,12 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
     marginHorizontal: 10,
+  },
+  debugText: {
+    fontSize: 10,
+    color: '#888888',
+    paddingHorizontal: 12,
+    paddingBottom: 6,
   },
   centerFill: {
     flex: 1,
