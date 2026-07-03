@@ -2,14 +2,16 @@
  * Cloze Plugin
  *
  * Snapshots note pages and lets you draw opaque "cloze" boxes over them,
- * then quiz yourself by tapping boxes one at a time to reveal what's
- * underneath and grading yourself
+ * organized into named decks, then quiz yourself by tapping boxes one at a
+ * time to reveal what's underneath and grading yourself.
  *
- * Cloze boxes (position + grade, keyed per page) are persisted to disk via
- * AsyncStorage under a key derived from the note's file path, so a deck
- * survives closing and reopening the plugin. Page snapshots themselves are
- * never persisted — they're cheap to regenerate on demand and can go stale
- * if the note changes. They are not written back into the note itself.
+ * Cloze boxes (position + grade + deck, keyed per page) and the note's deck
+ * list are persisted to disk via AsyncStorage under a key derived from the
+ * note's file path, so a deck survives closing and reopening the plugin.
+ * Page snapshots themselves are never persisted — they're cheap to
+ * regenerate on demand and can go stale if the note changes. They are not
+ * written back into the note itself (aside from a tiny off-canvas per-page
+ * marker used purely to track pages across reorder/insert/delete).
  *
  * @format
  */
@@ -25,6 +27,7 @@ import {
   StatusBar,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   useColorScheme,
   View,
@@ -39,13 +42,17 @@ import {
 
 type Mode = 'edit' | 'quiz';
 type Grade = 'unseen' | 'known' | 'missed';
-type QuizScope = 'page' | 'all';
-type Screen = 'editor' | 'manage';
+type Screen = 'editor' | 'library' | 'decks' | 'quizPicker';
 
-interface DeckSummary {
+interface NoteSummary {
   notePath: string;
   pageCount: number;
   clozeCount: number;
+}
+
+interface Deck {
+  id: string;
+  name: string;
 }
 
 interface ClozeBox {
@@ -57,6 +64,7 @@ interface ClozeBox {
   height: number;
   revealed: boolean;
   grade: Grade;
+  deckId: string;
 }
 
 interface PageAnchor {
@@ -93,22 +101,29 @@ interface QuizCard {
 
 type PersistedClozeBox = Pick<
   ClozeBox,
-  'id' | 'x' | 'y' | 'width' | 'height' | 'grade'
+  'id' | 'x' | 'y' | 'width' | 'height' | 'grade' | 'deckId'
 >;
 interface PersistedPageEntry {
   anchor: PageAnchor | null;
   clozes: PersistedClozeBox[];
 }
+interface PersistedNoteData {
+  decks: Deck[];
+  pages: Record<number, PersistedPageEntry>;
+}
 
 const MIN_BOX_PX = 14;
 // Must match the sidebar button's id in index.js's PluginManager.registerButton call.
 const CLOZE_BUTTON_ID = 100;
-const STORAGE_PREFIX = 'clozequiz:v3:';
+const STORAGE_PREFIX = 'clozequiz:v4:';
 const ANCHOR_TOKEN_PREFIX = 'CLOZE:';
 // Marker size, and how far past the page's actual pixel bounds to plant it
 // (bottom-right corner, just off-canvas), in page pixels.
 const ANCHOR_MARGIN = 20;
 const ANCHOR_SIZE = 40;
+const DEFAULT_DECK_ID = 'default';
+const DEFAULT_DECK_NAME = 'Default';
+const DEFAULT_DECKS: Deck[] = [{id: DEFAULT_DECK_ID, name: DEFAULT_DECK_NAME}];
 
 function storageKeyForNote(notePath: string): string {
   return `${STORAGE_PREFIX}${notePath}`;
@@ -118,6 +133,10 @@ function newAnchorToken(): string {
   return `${ANCHOR_TOKEN_PREFIX}${Date.now().toString(36)}${Math.random()
     .toString(36)
     .slice(2, 8)}`;
+}
+
+function newDeckId(): string {
+  return `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function shuffleArray<T>(items: T[]): T[] {
@@ -142,13 +161,23 @@ function App(): React.JSX.Element {
   const [shuffle, setShuffle] = useState(false);
   const [draftRect, setDraftRect] = useState<DraftRect | null>(null);
 
-  const [quizScope, setQuizScope] = useState<QuizScope>('page');
   const [quizQueue, setQuizQueue] = useState<QuizCard[]>([]);
   const [quizIndex, setQuizIndex] = useState(0);
+  const [activeQuizDeckIds, setActiveQuizDeckIds] = useState<string[]>([]);
+
+  const [decks, setDecks] = useState<Deck[]>(DEFAULT_DECKS);
+  const [activeDeckId, setActiveDeckId] = useState<string>(DEFAULT_DECK_ID);
 
   const [screen, setScreen] = useState<Screen>('editor');
-  const [decks, setDecks] = useState<DeckSummary[]>([]);
-  const [decksLoading, setDecksLoading] = useState(false);
+  const [library, setLibrary] = useState<NoteSummary[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+
+  const [newDeckName, setNewDeckName] = useState('');
+  const [renamingDeckId, setRenamingDeckId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [quizPickerSelection, setQuizPickerSelection] = useState<Set<string>>(
+    new Set(),
+  );
 
   const notePathRef = useRef<string | null>(null);
   const pluginDirRef = useRef<string | null>(null);
@@ -161,6 +190,10 @@ function App(): React.JSX.Element {
   currentPageRef.current = currentPage;
   const totalPagesRef = useRef(totalPages);
   totalPagesRef.current = totalPages;
+  const decksRef = useRef<Deck[]>(decks);
+  decksRef.current = decks;
+  const activeDeckIdRef = useRef(activeDeckId);
+  activeDeckIdRef.current = activeDeckId;
 
   const handleClose = () => {
     PluginManager.closePluginView();
@@ -327,7 +360,7 @@ function App(): React.JSX.Element {
     [findAnchorElement],
   );
 
-  // Best-effort: remove the marker element once a page's deck is cleared.
+  // Best-effort: remove the marker element once a page's clozes are cleared.
   const deletePageAnchor = useCallback(
     async (notePath: string, page: number, anchor: PageAnchor) => {
       try {
@@ -343,23 +376,23 @@ function App(): React.JSX.Element {
   );
 
   // Scans every note with saved cloze data (not just the currently open one)
-  // for the deck manager screen.
-  const loadDecks = useCallback(async () => {
-    setDecksLoading(true);
+  // for the library screen.
+  const loadLibrary = useCallback(async () => {
+    setLibraryLoading(true);
     try {
       const keys = await AsyncStorage.getAllKeys();
       const clozeKeys = keys.filter(k => k.startsWith(STORAGE_PREFIX));
       const entries = await AsyncStorage.multiGet(clozeKeys);
-      const summaries: DeckSummary[] = [];
+      const summaries: NoteSummary[] = [];
       for (const [key, raw] of entries) {
         if (!raw) {
           continue;
         }
         try {
-          const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
+          const parsed = JSON.parse(raw) as PersistedNoteData;
           let pageCount = 0;
           let clozeCount = 0;
-          for (const entry of Object.values(parsed)) {
+          for (const entry of Object.values(parsed.pages ?? {})) {
             if (entry?.clozes?.length) {
               pageCount++;
               clozeCount += entry.clozes.length;
@@ -377,27 +410,28 @@ function App(): React.JSX.Element {
         }
       }
       summaries.sort((a, b) => a.notePath.localeCompare(b.notePath));
-      setDecks(summaries);
+      setLibrary(summaries);
     } catch (e) {
-      setDecks([]);
+      setLibrary([]);
     } finally {
-      setDecksLoading(false);
+      setLibraryLoading(false);
     }
   }, []);
 
-  // Removes a note's saved clozes: best-effort cleanup of each page's off-canvas
-  // marker element (works for any note, not just the currently open one — the
-  // underlying APIs take an explicit notePath/page), then drops the storage
-  // entry. If it's the note currently open in the editor, clears live state too
-  // so the persist-on-change effect doesn't immediately write the data back.
-  const deleteDeck = useCallback(
+  // Removes ALL of a note's saved data (every deck): best-effort cleanup of
+  // each page's off-canvas marker element (works for any note, not just the
+  // currently open one — the underlying APIs take an explicit notePath/page),
+  // then drops the storage entry. If it's the note currently open in the
+  // editor, resets live state too so the persist-on-change effect doesn't
+  // immediately write the data back.
+  const deleteNoteData = useCallback(
     async (notePath: string) => {
       const key = storageKeyForNote(notePath);
       try {
         const raw = await AsyncStorage.getItem(key);
         if (raw) {
-          const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
-          for (const [pageStr, entry] of Object.entries(parsed)) {
+          const parsed = JSON.parse(raw) as PersistedNoteData;
+          for (const [pageStr, entry] of Object.entries(parsed.pages ?? {})) {
             if (entry?.anchor) {
               await deletePageAnchor(notePath, Number(pageStr), entry.anchor);
             }
@@ -409,32 +443,36 @@ function App(): React.JSX.Element {
       await AsyncStorage.removeItem(key);
       if (notePath === notePathRef.current) {
         setPages({});
+        setDecks(DEFAULT_DECKS);
+        setActiveDeckId(DEFAULT_DECK_ID);
       }
-      setDecks(prev => prev.filter(d => d.notePath !== notePath));
+      setLibrary(prev => prev.filter(n => n.notePath !== notePath));
     },
     [deletePageAnchor],
   );
 
-  const confirmDeleteDeck = useCallback(
-    (deck: DeckSummary) => {
+  const confirmDeleteNoteData = useCallback(
+    (note: NoteSummary) => {
       Alert.alert(
-        'Delete deck?',
-        `Remove ${deck.clozeCount} cloze${
-          deck.clozeCount === 1 ? '' : 's'
-        } across ${deck.pageCount} page${
-          deck.pageCount === 1 ? '' : 's'
-        } for "${deck.notePath.split('/').pop()}"? This can't be undone.`,
+        'Delete all cloze data?',
+        `Remove ${note.clozeCount} cloze${
+          note.clozeCount === 1 ? '' : 's'
+        } across ${note.pageCount} page${
+          note.pageCount === 1 ? '' : 's'
+        } (all decks) for "${note.notePath
+          .split('/')
+          .pop()}"? This can't be undone.`,
         [
           {text: 'Cancel', style: 'cancel'},
           {
             text: 'Delete',
             style: 'destructive',
-            onPress: () => deleteDeck(deck.notePath),
+            onPress: () => deleteNoteData(note.notePath),
           },
         ],
       );
     },
-    [deleteDeck],
+    [deleteNoteData],
   );
 
   const restorePersistedClozes = useCallback(
@@ -442,11 +480,26 @@ function App(): React.JSX.Element {
       try {
         const raw = await AsyncStorage.getItem(storageKeyForNote(notePath));
         if (!raw) {
+          setDecks(DEFAULT_DECKS);
+          setActiveDeckId(DEFAULT_DECK_ID);
           return {};
         }
-        const parsed = JSON.parse(raw) as Record<string, PersistedPageEntry>;
+        const parsed = JSON.parse(raw) as PersistedNoteData;
+        const restoredDecks =
+          Array.isArray(parsed.decks) && parsed.decks.length > 0
+            ? parsed.decks
+            : DEFAULT_DECKS;
+        setDecks(restoredDecks);
+        // Only reset the active deck if the current selection doesn't exist in
+        // this note's deck list (e.g. this is a genuinely different note, or
+        // first load) — otherwise a resync (Refresh, reopening the plugin,
+        // etc.) would silently revert whichever deck the user had switched to.
+        setActiveDeckId(prev =>
+          restoredDecks.some(d => d.id === prev) ? prev : restoredDecks[0].id,
+        );
+
         const restored: Record<number, PageState> = {};
-        for (const [pageStr, entry] of Object.entries(parsed)) {
+        for (const [pageStr, entry] of Object.entries(parsed.pages ?? {})) {
           if (
             !entry ||
             !Array.isArray(entry.clozes) ||
@@ -458,7 +511,11 @@ function App(): React.JSX.Element {
             imageUri: null,
             aspectRatio: 0.75,
             anchor: entry.anchor ?? null,
-            clozes: entry.clozes.map(b => ({...b, revealed: false})),
+            clozes: entry.clozes.map(b => ({
+              ...b,
+              deckId: b.deckId ?? DEFAULT_DECK_ID,
+              revealed: false,
+            })),
           };
         }
         if (Object.keys(restored).length === 0) {
@@ -469,6 +526,8 @@ function App(): React.JSX.Element {
         return restored;
       } catch (e) {
         // Corrupt or missing storage entry — just start with an empty deck.
+        setDecks(DEFAULT_DECKS);
+        setActiveDeckId(DEFAULT_DECK_ID);
         return {};
       }
     },
@@ -597,6 +656,7 @@ function App(): React.JSX.Element {
         return;
       }
 
+      const previousNotePath = notePathRef.current;
       notePathRef.current = notePath;
       setCurrentPage(page);
 
@@ -609,20 +669,26 @@ function App(): React.JSX.Element {
       setTotalPages(totalPagesValue);
       totalPagesRef.current = totalPagesValue;
 
-      // Any cached page snapshot could now belong to different content — pages
-      // may have been inserted/deleted/reordered in the note since we last
-      // looked (e.g. the plugin's JS context surviving a close+reopen without a
-      // fresh mount). Drop every cached image so revisited pages re-render from
-      // scratch instead of showing stale content under the wrong index. Clozes
-      // aren't touched here — reconcilePagesByAnchor below handles relocating
-      // those independently via each page's own anchor marker.
-      setPages(prev => {
-        const next: Record<number, PageState> = {};
-        for (const [pStr, ps] of Object.entries(prev)) {
-          next[Number(pStr)] = {...ps, imageUri: null};
-        }
-        return next;
-      });
+      if (previousNotePath !== notePath) {
+        // Switched to a different note (or first load) — the previous note's
+        // clozes/decks must not leak into this one.
+        setPages({});
+      } else {
+        // Any cached page snapshot could now belong to different content — pages
+        // may have been inserted/deleted/reordered in the note since we last
+        // looked (e.g. the plugin's JS context surviving a close+reopen without a
+        // fresh mount). Drop every cached image so revisited pages re-render from
+        // scratch instead of showing stale content under the wrong index. Clozes
+        // aren't touched here — reconcilePagesByAnchor below handles relocating
+        // those independently via each page's own anchor marker.
+        setPages(prev => {
+          const next: Record<number, PageState> = {};
+          for (const [pStr, ps] of Object.entries(prev)) {
+            next[Number(pStr)] = {...ps, imageUri: null};
+          }
+          return next;
+        });
+      }
 
       const restored = await restorePersistedClozes(notePath);
       await reconcilePagesByAnchor(restored);
@@ -658,34 +724,36 @@ function App(): React.JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist cloze positions + grades (not images, not `revealed`) whenever they change.
+  // Persist decks + cloze positions/grades (not images, not `revealed`) whenever they change.
   useEffect(() => {
     const notePath = notePathRef.current;
     if (!notePath) {
       return;
     }
-    const toSave: Record<number, PersistedPageEntry> = {};
+    const toSavePages: Record<number, PersistedPageEntry> = {};
     for (const [pageStr, ps] of Object.entries(pages)) {
       if (ps.clozes.length === 0) {
         continue;
       }
-      toSave[Number(pageStr)] = {
+      toSavePages[Number(pageStr)] = {
         anchor: ps.anchor,
-        clozes: ps.clozes.map(({id, x, y, width, height, grade}) => ({
+        clozes: ps.clozes.map(({id, x, y, width, height, grade, deckId}) => ({
           id,
           x,
           y,
           width,
           height,
           grade,
+          deckId,
         })),
       };
     }
+    const toSave: PersistedNoteData = {decks, pages: toSavePages};
     AsyncStorage.setItem(
       storageKeyForNote(notePath),
       JSON.stringify(toSave),
     ).catch(() => {});
-  }, [pages]);
+  }, [pages, decks]);
 
   const goToPage = (delta: number) => {
     const next = Math.min(Math.max(currentPage + delta, 0), totalPages - 1);
@@ -703,7 +771,11 @@ function App(): React.JSX.Element {
     if (!width || !height) {
       return false;
     }
-    const clozes = pagesRef.current[currentPageRef.current]?.clozes ?? [];
+    // Only the active deck's boxes are shown/interactive in edit mode, so only
+    // those should block starting a new draft rect underneath them.
+    const clozes = (
+      pagesRef.current[currentPageRef.current]?.clozes ?? []
+    ).filter(box => box.deckId === activeDeckIdRef.current);
     return clozes.some(box => {
       const bx = box.x * width;
       const by = box.y * height;
@@ -713,9 +785,9 @@ function App(): React.JSX.Element {
     });
   };
 
-  // Recreated only when mode changes; reads current page/cloze data through
-  // refs at call time so it never acts on stale state (see prior bug where
-  // this was built once via useRef and froze `mode` at its initial value).
+  // Recreated only when mode changes; reads current page/cloze/deck data
+  // through refs at call time so it never acts on stale state (see prior bug
+  // where this was built once via useRef and froze `mode` at its initial value).
   const panResponder = useMemo(
     () =>
       PanResponder.create({
@@ -762,6 +834,7 @@ function App(): React.JSX.Element {
                 height: prev.height / height,
                 revealed: false,
                 grade: 'unseen',
+                deckId: activeDeckIdRef.current,
               };
               const page = currentPageRef.current;
               let hadAnchor = false;
@@ -823,72 +896,204 @@ function App(): React.JSX.Element {
     }
   };
 
+  // Clears only the active deck's clozes on this page — other decks' clozes on
+  // the same page are left alone (they aren't even visible right now). The
+  // page anchor only gets cleaned up once the page has no clozes left at all.
   const clearCurrentPageClozes = () => {
     const page = currentPage;
     const anchor = pagesRef.current[page]?.anchor ?? null;
+    let becameEmpty = false;
     setPages(prev => {
       const existing = prev[page];
       if (!existing) {
         return prev;
       }
-      return {...prev, [page]: {...existing, clozes: [], anchor: null}};
+      const clozes = existing.clozes.filter(c => c.deckId !== activeDeckId);
+      becameEmpty = clozes.length === 0;
+      return {
+        ...prev,
+        [page]: {
+          ...existing,
+          clozes,
+          anchor: becameEmpty ? null : existing.anchor,
+        },
+      };
     });
-    if (anchor && notePathRef.current) {
+    if (becameEmpty && anchor && notePathRef.current) {
       deletePageAnchor(notePathRef.current, page, anchor);
     }
   };
 
-  const buildQueue = (
-    scope: QuizScope,
-  ): {order: number[]; cards: QuizCard[]} => {
-    const order =
-      scope === 'all'
-        ? Object.keys(pagesRef.current)
-            .map(Number)
-            .sort((a, b) => a - b)
-        : [currentPageRef.current];
+  // Deck CRUD. Decks are note-level metadata; clozes reference a deckId.
+  const createDeck = useCallback((name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      return;
+    }
+    const id = newDeckId();
+    setDecks(prev => [...prev, {id, name: trimmed}]);
+    setActiveDeckId(id);
+  }, []);
+
+  const renameDeck = useCallback((id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      return;
+    }
+    setDecks(prev => prev.map(d => (d.id === id ? {...d, name: trimmed} : d)));
+  }, []);
+
+  // Deletes a deck and every cloze tagged with it (across all pages), cleaning
+  // up each affected page's off-canvas marker if it becomes clozeless. Refuses
+  // to delete the last remaining deck.
+  const deleteDeckAndClozes = useCallback(
+    async (id: string) => {
+      if (decksRef.current.length <= 1) {
+        return;
+      }
+      const notePath = notePathRef.current;
+      if (notePath) {
+        for (const [pStr, ps] of Object.entries(pagesRef.current)) {
+          const willBeEmpty =
+            ps.clozes.length > 0 && ps.clozes.every(c => c.deckId === id);
+          if (willBeEmpty && ps.anchor) {
+            await deletePageAnchor(notePath, Number(pStr), ps.anchor);
+          }
+        }
+      }
+      setPages(prev => {
+        const next: Record<number, PageState> = {};
+        for (const [pStr, ps] of Object.entries(prev)) {
+          const clozes = ps.clozes.filter(c => c.deckId !== id);
+          next[Number(pStr)] =
+            clozes.length === 0
+              ? {...ps, clozes: [], anchor: null}
+              : {...ps, clozes};
+        }
+        return next;
+      });
+      const remaining = decksRef.current.filter(d => d.id !== id);
+      setDecks(remaining);
+      if (activeDeckIdRef.current === id) {
+        setActiveDeckId(remaining[0]?.id ?? DEFAULT_DECK_ID);
+      }
+    },
+    [deletePageAnchor],
+  );
+
+  const deckClozeCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const ps of Object.values(pages)) {
+      for (const c of ps.clozes) {
+        counts.set(c.deckId, (counts.get(c.deckId) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [pages]);
+
+  const confirmDeleteDeckAndClozes = useCallback(
+    (deck: Deck) => {
+      if (decksRef.current.length <= 1) {
+        Alert.alert('Cannot delete', 'You need at least one deck.');
+        return;
+      }
+      const count = deckClozeCounts.get(deck.id) ?? 0;
+      Alert.alert(
+        `Delete "${deck.name}"?`,
+        `This removes ${count} cloze${
+          count === 1 ? '' : 's'
+        } in this deck. This can't be undone.`,
+        [
+          {text: 'Cancel', style: 'cancel'},
+          {
+            text: 'Delete',
+            style: 'destructive',
+            onPress: () => deleteDeckAndClozes(deck.id),
+          },
+        ],
+      );
+    },
+    [deckClozeCounts, deleteDeckAndClozes],
+  );
+
+  const buildQueue = (deckIds: Set<string>): QuizCard[] => {
+    const order = Object.keys(pagesRef.current)
+      .map(Number)
+      .sort((a, b) => a - b);
     let cards: QuizCard[] = [];
     for (const p of order) {
       const clozes = pagesRef.current[p]?.clozes ?? [];
       for (const c of clozes) {
-        cards.push({page: p, id: c.id});
+        if (deckIds.has(c.deckId)) {
+          cards.push({page: p, id: c.id});
+        }
       }
     }
     if (shuffle) {
       cards = shuffleArray(cards);
     }
-    return {order, cards};
+    return cards;
   };
 
-  const startQuiz = (scope: QuizScope) => {
-    const {order, cards} = buildQueue(scope);
+  const startQuiz = (deckIds: Set<string>) => {
+    const cards = buildQueue(deckIds);
     if (cards.length === 0) {
       return;
     }
+    const cardIds = new Set(cards.map(c => c.id));
     setPages(prev => {
       const next = {...prev};
-      for (const p of order) {
-        if (!next[p]) {
+      for (const [pStr, ps] of Object.entries(next)) {
+        if (!ps.clozes.some(c => cardIds.has(c.id))) {
           continue;
         }
-        next[p] = {
-          ...next[p],
-          clozes: next[p].clozes.map(c => ({
-            ...c,
-            revealed: false,
-            grade: 'unseen' as Grade,
-          })),
+        next[Number(pStr)] = {
+          ...ps,
+          clozes: ps.clozes.map(c =>
+            cardIds.has(c.id)
+              ? {...c, revealed: false, grade: 'unseen' as Grade}
+              : c,
+          ),
         };
       }
       return next;
     });
-    setQuizScope(scope);
+    setActiveQuizDeckIds(Array.from(deckIds));
     setQuizQueue(cards);
     setQuizIndex(0);
     setMode('quiz');
+    setScreen('editor');
   };
 
-  const restartQuiz = () => startQuiz(quizScope);
+  const restartQuiz = () => startQuiz(new Set(activeQuizDeckIds));
+
+  const openQuizPicker = () => {
+    const withClozes = decks
+      .filter(d => (deckClozeCounts.get(d.id) ?? 0) > 0)
+      .map(d => d.id);
+    setQuizPickerSelection(new Set(withClozes));
+    setScreen('quizPicker');
+  };
+
+  const toggleQuizPickerDeck = (id: string) => {
+    setQuizPickerSelection(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const quizPickerCount = useMemo(() => {
+    let total = 0;
+    for (const id of quizPickerSelection) {
+      total += deckClozeCounts.get(id) ?? 0;
+    }
+    return total;
+  }, [quizPickerSelection, deckClozeCounts]);
 
   const resetCurrentQueue = () => {
     setPages(prev => {
@@ -985,17 +1190,12 @@ function App(): React.JSX.Element {
   const goNextCard = () => setQuizIndex(i => Math.min(i + 1, quizQueue.length));
 
   const currentPageState = pages[currentPage];
-  const currentPageClozeCount = currentPageState?.clozes.length ?? 0;
+  // Scoped to the active deck, matching what's actually shown/clearable in edit mode.
+  const currentPageClozeCount =
+    currentPageState?.clozes.filter(c => c.deckId === activeDeckId).length ?? 0;
   const totalClozesAllPages = useMemo(
     () => Object.values(pages).reduce((sum, ps) => sum + ps.clozes.length, 0),
     [pages],
-  );
-  const otherPagesHaveClozes = useMemo(
-    () =>
-      Object.entries(pages).some(
-        ([p, ps]) => Number(p) !== currentPage && ps.clozes.length > 0,
-      ),
-    [pages, currentPage],
   );
 
   const atSummary = mode === 'quiz' && quizIndex >= quizQueue.length;
@@ -1020,6 +1220,8 @@ function App(): React.JSX.Element {
     return {known, missed, total: quizQueue.length};
   }, [quizQueue, pages]);
 
+  const activeDeck = decks.find(d => d.id === activeDeckId) ?? decks[0];
+
   const textColor = isDarkMode ? '#ffffff' : '#000000';
   const bg = isDarkMode ? '#000000' : '#ffffff';
 
@@ -1039,7 +1241,7 @@ function App(): React.JSX.Element {
         backgroundColor={bg}
       />
 
-      {screen === 'manage' ? (
+      {screen === 'library' ? (
         <>
           <View style={styles.topBar}>
             <Pressable
@@ -1048,52 +1250,236 @@ function App(): React.JSX.Element {
               <Text style={[styles.iconText, {color: textColor}]}>‹</Text>
             </Pressable>
             <Text style={[styles.title, {color: textColor}]} numberOfLines={1}>
-              Manage Decks
+              Notes with Clozes
             </Text>
             <View style={styles.topBarActions}>
-              <TouchableOpacity style={styles.pillButton} onPress={loadDecks}>
+              <TouchableOpacity style={styles.pillButton} onPress={loadLibrary}>
                 <Text style={styles.pillButtonText}>Refresh</Text>
               </TouchableOpacity>
             </View>
           </View>
 
-          {decksLoading ? (
+          {libraryLoading ? (
             <View style={styles.centerFill}>
               <ActivityIndicator size="large" color={textColor} />
             </View>
-          ) : decks.length === 0 ? (
+          ) : library.length === 0 ? (
             <View style={styles.centerFill}>
               <Text style={[styles.errorText, {color: textColor}]}>
-                No saved decks yet.
+                No saved cloze data yet.
               </Text>
             </View>
           ) : (
             <ScrollView contentContainerStyle={styles.deckListContent}>
-              {decks.map(deck => (
-                <View key={deck.notePath} style={styles.deckRow}>
+              {library.map(note => (
+                <View key={note.notePath} style={styles.deckRow}>
                   <View style={styles.deckInfo}>
                     <Text
                       style={[styles.deckName, {color: textColor}]}
                       numberOfLines={1}>
-                      {deck.notePath.split('/').pop()}
+                      {note.notePath.split('/').pop()}
                     </Text>
                     <Text style={styles.deckMeta}>
-                      {deck.pageCount} page{deck.pageCount === 1 ? '' : 's'} ·{' '}
-                      {deck.clozeCount} cloze{deck.clozeCount === 1 ? '' : 's'}
-                      {deck.notePath === notePathRef.current
+                      {note.pageCount} page{note.pageCount === 1 ? '' : 's'} ·{' '}
+                      {note.clozeCount} cloze{note.clozeCount === 1 ? '' : 's'}
+                      {note.notePath === notePathRef.current
                         ? ' · current note'
                         : ''}
                     </Text>
                   </View>
                   <TouchableOpacity
                     style={styles.deckDeleteButton}
-                    onPress={() => confirmDeleteDeck(deck)}>
+                    onPress={() => confirmDeleteNoteData(note)}>
                     <Text style={styles.deckDeleteButtonText}>Delete</Text>
                   </TouchableOpacity>
                 </View>
               ))}
             </ScrollView>
           )}
+        </>
+      ) : screen === 'decks' ? (
+        <>
+          <View style={styles.topBar}>
+            <Pressable
+              style={styles.iconButton}
+              onPress={() => setScreen('editor')}>
+              <Text style={[styles.iconText, {color: textColor}]}>‹</Text>
+            </Pressable>
+            <Text style={[styles.title, {color: textColor}]} numberOfLines={1}>
+              Decks in this Note
+            </Text>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.deckListContent}>
+            {decks.map(deck => {
+              const count = deckClozeCounts.get(deck.id) ?? 0;
+              const isActive = deck.id === activeDeckId;
+              const isRenaming = renamingDeckId === deck.id;
+              return (
+                <View
+                  key={deck.id}
+                  style={[styles.deckRow, isActive && styles.deckRowActive]}>
+                  <View style={styles.deckInfo}>
+                    {isRenaming ? (
+                      <TextInput
+                        style={[styles.deckNameInput, {color: textColor}]}
+                        value={renameDraft}
+                        onChangeText={setRenameDraft}
+                        autoFocus
+                        onSubmitEditing={() => {
+                          renameDeck(deck.id, renameDraft);
+                          setRenamingDeckId(null);
+                        }}
+                      />
+                    ) : (
+                      <TouchableOpacity
+                        onPress={() => setActiveDeckId(deck.id)}>
+                        <Text
+                          style={[styles.deckName, {color: textColor}]}
+                          numberOfLines={1}>
+                          {deck.name}
+                          {isActive ? ' (active)' : ''}
+                        </Text>
+                        <Text style={styles.deckMeta}>
+                          {count} cloze{count === 1 ? '' : 's'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                  {isRenaming ? (
+                    <TouchableOpacity
+                      style={styles.deckDeleteButton}
+                      onPress={() => {
+                        renameDeck(deck.id, renameDraft);
+                        setRenamingDeckId(null);
+                      }}>
+                      <Text style={styles.deckDeleteButtonText}>Save</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <>
+                      <TouchableOpacity
+                        style={styles.deckDeleteButton}
+                        onPress={() => {
+                          setRenamingDeckId(deck.id);
+                          setRenameDraft(deck.name);
+                        }}>
+                        <Text style={styles.deckDeleteButtonText}>Rename</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.deckDeleteButton}
+                        onPress={() => confirmDeleteDeckAndClozes(deck)}
+                        disabled={decks.length <= 1}>
+                        <Text
+                          style={[
+                            styles.deckDeleteButtonText,
+                            decks.length <= 1 && styles.pillButtonTextDisabled,
+                          ]}>
+                          Delete
+                        </Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
+                </View>
+              );
+            })}
+          </ScrollView>
+
+          <View style={styles.newDeckRow}>
+            <TextInput
+              style={[styles.newDeckInput, {color: textColor}]}
+              placeholder="New deck name"
+              placeholderTextColor="#888888"
+              value={newDeckName}
+              onChangeText={setNewDeckName}
+              onSubmitEditing={() => {
+                createDeck(newDeckName);
+                setNewDeckName('');
+              }}
+            />
+            <TouchableOpacity
+              style={styles.pillButton}
+              onPress={() => {
+                createDeck(newDeckName);
+                setNewDeckName('');
+              }}
+              disabled={!newDeckName.trim()}>
+              <Text style={styles.pillButtonText}>Add</Text>
+            </TouchableOpacity>
+          </View>
+        </>
+      ) : screen === 'quizPicker' ? (
+        <>
+          <View style={styles.topBar}>
+            <Pressable
+              style={styles.iconButton}
+              onPress={() => setScreen('editor')}>
+              <Text style={[styles.iconText, {color: textColor}]}>‹</Text>
+            </Pressable>
+            <Text style={[styles.title, {color: textColor}]} numberOfLines={1}>
+              Quiz: Pick Decks
+            </Text>
+            <View style={styles.topBarActions}>
+              <TouchableOpacity
+                style={styles.pillButton}
+                onPress={() =>
+                  setQuizPickerSelection(new Set(decks.map(d => d.id)))
+                }>
+                <Text style={styles.pillButtonText}>All</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.pillButton}
+                onPress={() => setQuizPickerSelection(new Set())}>
+                <Text style={styles.pillButtonText}>None</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+
+          <ScrollView contentContainerStyle={styles.deckListContent}>
+            {decks.map(deck => {
+              const count = deckClozeCounts.get(deck.id) ?? 0;
+              const selected = quizPickerSelection.has(deck.id);
+              return (
+                <TouchableOpacity
+                  key={deck.id}
+                  style={[styles.deckRow, selected && styles.deckRowActive]}
+                  onPress={() => toggleQuizPickerDeck(deck.id)}
+                  disabled={count === 0}>
+                  <View style={styles.deckCheckbox}>
+                    {selected && <Text style={styles.deckCheckboxMark}>✓</Text>}
+                  </View>
+                  <View style={styles.deckInfo}>
+                    <Text
+                      style={[
+                        styles.deckName,
+                        {color: textColor},
+                        count === 0 && styles.pillButtonTextDisabled,
+                      ]}
+                      numberOfLines={1}>
+                      {deck.name}
+                    </Text>
+                    <Text style={styles.deckMeta}>
+                      {count} cloze{count === 1 ? '' : 's'}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </ScrollView>
+
+          <View style={styles.bottomBar}>
+            <TouchableOpacity
+              style={styles.modeButton}
+              onPress={() => startQuiz(quizPickerSelection)}
+              disabled={quizPickerCount === 0}>
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  quizPickerCount === 0 && styles.modeButtonTextDisabled,
+                ]}>
+                Start Quiz ({quizPickerCount})
+              </Text>
+            </TouchableOpacity>
+          </View>
         </>
       ) : (
         <>
@@ -1112,10 +1498,20 @@ function App(): React.JSX.Element {
                   <TouchableOpacity
                     style={styles.pillButton}
                     onPress={() => {
-                      setScreen('manage');
-                      loadDecks();
+                      setScreen('library');
+                      loadLibrary();
                     }}>
-                    <Text style={styles.pillButtonText}>Decks</Text>
+                    <Text style={styles.pillButtonText}>Notes</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.pillButton}
+                    onPress={() => setScreen('decks')}>
+                    <Text
+                      style={styles.pillButtonText}
+                      numberOfLines={1}
+                      ellipsizeMode="tail">
+                      Deck: {activeDeck?.name ?? DEFAULT_DECK_NAME}
+                    </Text>
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.pillButton}
@@ -1246,7 +1642,12 @@ function App(): React.JSX.Element {
                   resizeMode="contain"
                 />
 
-                {currentPageState.clozes.map(box => {
+                {(mode === 'edit'
+                  ? currentPageState.clozes.filter(
+                      b => b.deckId === activeDeckId,
+                    )
+                  : currentPageState.clozes
+                ).map(box => {
                   const style = {
                     left: `${box.x * 100}%` as const,
                     top: `${box.y * 100}%` as const,
@@ -1352,29 +1753,20 @@ function App(): React.JSX.Element {
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.modeButton}
-                    onPress={() => startQuiz('page')}
-                    disabled={currentPageClozeCount === 0}>
+                    onPress={openQuizPicker}
+                    disabled={totalClozesAllPages === 0}>
                     <Text
                       style={[
                         styles.modeButtonText,
-                        currentPageClozeCount === 0 &&
+                        totalClozesAllPages === 0 &&
                           styles.modeButtonTextDisabled,
                       ]}>
-                      Quiz Me
-                      {currentPageClozeCount > 0
-                        ? ` (${currentPageClozeCount})`
+                      Quiz...
+                      {totalClozesAllPages > 0
+                        ? ` (${totalClozesAllPages})`
                         : ''}
                     </Text>
                   </TouchableOpacity>
-                  {otherPagesHaveClozes && (
-                    <TouchableOpacity
-                      style={styles.modeButton}
-                      onPress={() => startQuiz('all')}>
-                      <Text style={styles.modeButtonText}>
-                        Quiz All Pages ({totalClozesAllPages})
-                      </Text>
-                    </TouchableOpacity>
-                  )}
                 </>
               ) : atSummary ? (
                 <>
@@ -1485,6 +1877,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 5,
     marginLeft: 6,
+    maxWidth: 130,
   },
   pillButtonText: {
     fontSize: 13,
@@ -1539,6 +1932,23 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     marginBottom: 10,
   },
+  deckRowActive: {
+    borderWidth: 2,
+  },
+  deckCheckbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: '#000000',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+  deckCheckboxMark: {
+    fontSize: 14,
+    fontWeight: '700',
+  },
   deckInfo: {
     flex: 1,
     marginRight: 10,
@@ -1546,6 +1956,13 @@ const styles = StyleSheet.create({
   deckName: {
     fontSize: 15,
     fontWeight: '600',
+  },
+  deckNameInput: {
+    fontSize: 15,
+    fontWeight: '600',
+    borderBottomWidth: 1,
+    borderColor: '#000000',
+    paddingVertical: 2,
   },
   deckMeta: {
     fontSize: 12,
@@ -1558,10 +1975,27 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     paddingHorizontal: 12,
     paddingVertical: 6,
+    marginLeft: 6,
   },
   deckDeleteButtonText: {
     fontSize: 13,
     fontWeight: '600',
+  },
+  newDeckRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  newDeckInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#000000',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginRight: 8,
+    fontSize: 14,
   },
   retryButton: {
     borderWidth: 1,
