@@ -5,11 +5,11 @@
  * then quiz yourself by tapping boxes one at a time to reveal what's
  * underneath and grading yourself
  *
- * Clozes live in memory for the current plugin session, keyed per page,
- * so you can build a deck across multiple pages of the same note and quiz
- * across all of them at once. They are not written back into the note and
- * do not survive closing the plugin (there's no storage API exposed by
- * sn-plugin-lib for persisting arbitrary data to disk).
+ * Cloze boxes (position + grade, keyed per page) are persisted to disk via
+ * AsyncStorage under a key derived from the note's file path, so a deck
+ * survives closing and reopening the plugin. Page snapshots themselves are
+ * never persisted — they're cheap to regenerate on demand and can go stale
+ * if the note changes. They are not written back into the note itself.
  *
  * @format
  */
@@ -27,6 +27,7 @@ import {
   useColorScheme,
   View,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {PluginCommAPI, PluginFileAPI, PluginManager} from 'sn-plugin-lib';
 
 type Mode = 'edit' | 'quiz';
@@ -62,7 +63,14 @@ interface QuizCard {
   id: string;
 }
 
+type PersistedClozeBox = Pick<ClozeBox, 'id' | 'x' | 'y' | 'width' | 'height' | 'grade'>;
+
 const MIN_BOX_PX = 14;
+const STORAGE_PREFIX = 'clozequiz:v1:';
+
+function storageKeyForNote(notePath: string): string {
+  return `${STORAGE_PREFIX}${notePath}`;
+}
 
 function shuffleArray<T>(items: T[]): T[] {
   const arr = [...items];
@@ -153,6 +161,34 @@ function App(): React.JSX.Element {
     }
   }, []);
 
+  const restorePersistedClozes = useCallback(async (notePath: string) => {
+    try {
+      const raw = await AsyncStorage.getItem(storageKeyForNote(notePath));
+      if (!raw) {
+        return;
+      }
+      const parsed = JSON.parse(raw) as Record<string, PersistedClozeBox[]>;
+      const restored: Record<number, PageState> = {};
+      for (const [pageStr, boxes] of Object.entries(parsed)) {
+        if (!Array.isArray(boxes) || boxes.length === 0) {
+          continue;
+        }
+        restored[Number(pageStr)] = {
+          imageUri: null,
+          aspectRatio: 0.75,
+          clozes: boxes.map(b => ({...b, revealed: false})),
+        };
+      }
+      if (Object.keys(restored).length === 0) {
+        return;
+      }
+      // In-memory state (if any already loaded this session) wins over the restored copy.
+      setPages(prev => ({...restored, ...prev}));
+    } catch (e) {
+      // Corrupt or missing storage entry — just start with an empty deck.
+    }
+  }, []);
+
   const syncCurrentPage = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -177,18 +213,42 @@ function App(): React.JSX.Element {
         totalRes?.success && typeof totalRes.result === 'number' ? totalRes.result : 1;
       setTotalPages(Math.max(1, total));
 
+      await restorePersistedClozes(notePath);
       await loadPageSnapshot(page, true);
     } catch (e) {
       setError('Something went wrong loading the page.');
     } finally {
       setLoading(false);
     }
-  }, [loadPageSnapshot]);
+  }, [loadPageSnapshot, restorePersistedClozes]);
 
   useEffect(() => {
     syncCurrentPage();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Persist cloze positions + grades (not images, not `revealed`) whenever they change.
+  useEffect(() => {
+    const notePath = notePathRef.current;
+    if (!notePath) {
+      return;
+    }
+    const toSave: Record<number, PersistedClozeBox[]> = {};
+    for (const [pageStr, ps] of Object.entries(pages)) {
+      if (ps.clozes.length === 0) {
+        continue;
+      }
+      toSave[Number(pageStr)] = ps.clozes.map(({id, x, y, width, height, grade}) => ({
+        id,
+        x,
+        y,
+        width,
+        height,
+        grade,
+      }));
+    }
+    AsyncStorage.setItem(storageKeyForNote(notePath), JSON.stringify(toSave)).catch(() => {});
+  }, [pages]);
 
   const goToPage = (delta: number) => {
     const next = Math.min(Math.max(currentPage + delta, 0), totalPages - 1);

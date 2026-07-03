@@ -120,8 +120,8 @@ is_ignored_module_name() {
     case "$lower" in
         react-native|react|sn-plugin-lib) return 0 ;;
     esac
-    [[ "$lower" == @react-native* ]] && return 0
-    [[ "$lower" == @react-navigation* ]] && return 0
+    [[ "$lower" == @react-native/* ]] && return 0
+    [[ "$lower" == @react-navigation/* ]] && return 0
     return 1
 }
 
