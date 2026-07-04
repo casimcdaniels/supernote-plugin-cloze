@@ -11,7 +11,8 @@ Usage: ./release.sh <version> [--dry-run]
 
 Bumps package.json, builds the plugin via buildPlugin.sh, commits the version
 bump, tags it vX.Y.Z, pushes both, and creates a GitHub release with
-build/outputs/<name>.snplg attached.
+build/outputs/<name>-vX.Y.Z.snplg attached (a versioned copy of the build
+output, so the uploaded filename identifies the release on its own).
 
 --dry-run: bumps the version and builds so you can inspect the .snplg, then
            reverts package.json and stops — no commit, tag, push, or release.
@@ -80,8 +81,13 @@ PACKAGE_NAME="$(node -p "require('./package.json').name")"
 SNPLG_PATH="build/outputs/${PACKAGE_NAME}.snplg"
 [[ -f "$SNPLG_PATH" ]] || { echo "Error: expected build output not found at $SNPLG_PATH" >&2; exit 1; }
 
+# Give the uploaded asset a versioned filename (e.g. cloze-v1.2.0.snplg) so it's
+# identifiable on its own, separate from buildPlugin.sh's plain-named output.
+VERSIONED_SNPLG_PATH="build/outputs/${PACKAGE_NAME}-${TAG}.snplg"
+cp "$SNPLG_PATH" "$VERSIONED_SNPLG_PATH"
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "==> Dry run complete. Built: $SNPLG_PATH (version $NEW_VERSION)"
+  echo "==> Dry run complete. Built: $VERSIONED_SNPLG_PATH (version $NEW_VERSION)"
   cleanup_bump
   trap - ERR
   exit 0
@@ -99,7 +105,7 @@ git push origin "$BRANCH"
 git push origin "$TAG"
 
 echo "==> Creating GitHub release"
-gh release create "$TAG" "$SNPLG_PATH" --title "$TAG" --generate-notes
+gh release create "$TAG" "$VERSIONED_SNPLG_PATH" --title "$TAG" --generate-notes
 
 trap - ERR
 echo "Done: $(gh release view "$TAG" --json url -q .url)"
