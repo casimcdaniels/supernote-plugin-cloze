@@ -1646,7 +1646,9 @@ function App(): React.JSX.Element {
                   ? currentPageState.clozes.filter(
                       b => b.deckId === activeDeckId,
                     )
-                  : currentPageState.clozes
+                  : currentPageState.clozes.filter(b =>
+                      activeQuizDeckIds.includes(b.deckId),
+                    )
                 ).map(box => {
                   const style = {
                     left: `${box.x * 100}%` as const,
