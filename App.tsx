@@ -139,15 +139,6 @@ function newDeckId(): string {
   return `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function shuffleArray<T>(items: T[]): T[] {
-  const arr = [...items];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
-}
-
 function App(): React.JSX.Element {
   const isDarkMode = useColorScheme() === 'dark';
 
@@ -158,7 +149,6 @@ function App(): React.JSX.Element {
   const [pages, setPages] = useState<Record<number, PageState>>({});
 
   const [mode, setMode] = useState<Mode>('edit');
-  const [shuffle, setShuffle] = useState(false);
   const [draftRect, setDraftRect] = useState<DraftRect | null>(null);
 
   const [quizQueue, setQuizQueue] = useState<QuizCard[]>([]);
@@ -766,6 +756,35 @@ function App(): React.JSX.Element {
     }
   };
 
+  // Pages that have at least one cloze in the active deck — used to jump
+  // straight between clozed pages instead of stepping one page at a time.
+  const clozedPagesForActiveDeck = useMemo(
+    () =>
+      Object.keys(pages)
+        .map(Number)
+        .filter(p =>
+          (pages[p]?.clozes ?? []).some(c => c.deckId === activeDeckId),
+        )
+        .sort((a, b) => a - b),
+    [pages, activeDeckId],
+  );
+  const hasPrevClozedPage = clozedPagesForActiveDeck.some(p => p < currentPage);
+  const hasNextClozedPage = clozedPagesForActiveDeck.some(p => p > currentPage);
+
+  const goToAdjacentClozedPage = (direction: 1 | -1) => {
+    const target =
+      direction === 1
+        ? clozedPagesForActiveDeck.find(p => p > currentPage)
+        : [...clozedPagesForActiveDeck].reverse().find(p => p < currentPage);
+    if (target === undefined) {
+      return;
+    }
+    setCurrentPage(target);
+    if (!pagesRef.current[target]?.imageUri) {
+      loadPageSnapshot(target);
+    }
+  };
+
   const isInsideAnyBox = (x: number, y: number) => {
     const {width, height} = containerSize.current;
     if (!width || !height) {
@@ -1020,7 +1039,7 @@ function App(): React.JSX.Element {
     const order = Object.keys(pagesRef.current)
       .map(Number)
       .sort((a, b) => a - b);
-    let cards: QuizCard[] = [];
+    const cards: QuizCard[] = [];
     for (const p of order) {
       const clozes = pagesRef.current[p]?.clozes ?? [];
       for (const c of clozes) {
@@ -1028,9 +1047,6 @@ function App(): React.JSX.Element {
           cards.push({page: p, id: c.id});
         }
       }
-    }
-    if (shuffle) {
-      cards = shuffleArray(cards);
     }
     return cards;
   };
@@ -1224,15 +1240,8 @@ function App(): React.JSX.Element {
 
   const textColor = isDarkMode ? '#ffffff' : '#000000';
   const bg = isDarkMode ? '#000000' : '#ffffff';
-
-  const title =
-    mode === 'quiz'
-      ? atSummary
-        ? 'Quiz Me · Done'
-        : `Quiz Me · Card ${quizIndex + 1}/${quizQueue.length}`
-      : `Cloze Quiz${
-          totalPages > 1 ? ` · Page ${currentPage + 1}/${totalPages}` : ''
-        }`;
+  const noteBarBg = isDarkMode ? '#1a1a1a' : '#ececec';
+  const noteFileName = notePathRef.current?.split('/').pop() ?? '';
 
   return (
     <View style={[styles.container, {backgroundColor: bg}]}>
@@ -1483,113 +1492,219 @@ function App(): React.JSX.Element {
         </>
       ) : (
         <>
-          <View style={styles.topBar}>
+          <View
+            style={[
+              styles.noteBar,
+              {backgroundColor: noteBarBg, borderBottomColor: textColor},
+            ]}>
+            <Text
+              style={[styles.noteBarText, {color: textColor}]}
+              numberOfLines={1}>
+              {noteFileName}
+            </Text>
+          </View>
+
+          <View style={[styles.toolbar, {borderBottomColor: textColor}]}>
             <Pressable style={styles.iconButton} onPress={handleClose}>
               <Text style={[styles.iconText, {color: textColor}]}>✕</Text>
             </Pressable>
 
-            <Text style={[styles.title, {color: textColor}]} numberOfLines={1}>
-              {title}
-            </Text>
+            {mode === 'edit' && (
+              <Pressable
+                style={styles.iconButton}
+                onPress={() => {
+                  setScreen('library');
+                  loadLibrary();
+                }}>
+                <Text style={[styles.iconText, {color: textColor}]}>☰</Text>
+              </Pressable>
+            )}
 
-            <View style={styles.topBarActions}>
-              {mode === 'edit' ? (
-                <>
-                  <TouchableOpacity
-                    style={styles.pillButton}
-                    onPress={() => {
-                      setScreen('library');
-                      loadLibrary();
-                    }}>
-                    <Text style={styles.pillButtonText}>Notes</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.pillButton}
-                    onPress={() => setScreen('decks')}>
-                    <Text
-                      style={styles.pillButtonText}
-                      numberOfLines={1}
-                      ellipsizeMode="tail">
-                      Deck: {activeDeck?.name ?? DEFAULT_DECK_NAME}
+            <TouchableOpacity
+              style={styles.tabButton}
+              onPress={() => setMode('edit')}>
+              <Text
+                style={[
+                  styles.tabText,
+                  {color: textColor},
+                  mode === 'edit' && styles.tabTextActive,
+                ]}>
+                Edit
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.tabButton}
+              disabled={mode === 'edit' && totalClozesAllPages === 0}
+              onPress={() => {
+                if (mode !== 'quiz') {
+                  openQuizPicker();
+                }
+              }}>
+              <Text
+                style={[
+                  styles.tabText,
+                  {color: textColor},
+                  mode === 'quiz' && styles.tabTextActive,
+                  mode === 'edit' &&
+                    totalClozesAllPages === 0 &&
+                    styles.pillButtonTextDisabled,
+                ]}>
+                Quiz
+              </Text>
+            </TouchableOpacity>
+
+            {mode === 'edit' && (
+              <TouchableOpacity
+                style={styles.toolbarButton}
+                onPress={() => setScreen('decks')}>
+                <Text style={styles.toolbarIcon}>▤</Text>
+                <Text
+                  style={styles.toolbarCaption}
+                  numberOfLines={1}
+                  ellipsizeMode="tail">
+                  {activeDeck?.name ?? DEFAULT_DECK_NAME}
+                </Text>
+              </TouchableOpacity>
+            )}
+
+            {mode === 'edit' ? (
+              <>
+                {totalPages > 1 && (
+                  <>
+                    <View
+                      style={[styles.toolbarDivider, styles.toolbarDividerPush]}
+                    />
+                    <TouchableOpacity
+                      style={styles.toolbarButton}
+                      onPress={() => goToAdjacentClozedPage(-1)}
+                      disabled={!hasPrevClozedPage}>
+                      <Text
+                        style={[
+                          styles.toolbarIcon,
+                          !hasPrevClozedPage && styles.toolbarIconDisabled,
+                        ]}>
+                        «
+                      </Text>
+                      <Text
+                        style={[
+                          styles.toolbarCaption,
+                          !hasPrevClozedPage && styles.toolbarCaptionDisabled,
+                        ]}>
+                        Cloze
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.toolbarButton}
+                      onPress={() => goToPage(-1)}
+                      disabled={currentPage === 0}>
+                      <Text
+                        style={[
+                          styles.toolbarIcon,
+                          currentPage === 0 && styles.toolbarIconDisabled,
+                        ]}>
+                        ‹
+                      </Text>
+                      <Text
+                        style={[
+                          styles.toolbarCaption,
+                          currentPage === 0 && styles.toolbarCaptionDisabled,
+                        ]}>
+                        Prev
+                      </Text>
+                    </TouchableOpacity>
+                    <Text style={[styles.toolbarPageText, {color: textColor}]}>
+                      {currentPage + 1}/{totalPages}
                     </Text>
-                  </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.toolbarButton}
+                      onPress={() => goToPage(1)}
+                      disabled={currentPage === totalPages - 1}>
+                      <Text
+                        style={[
+                          styles.toolbarIcon,
+                          currentPage === totalPages - 1 &&
+                            styles.toolbarIconDisabled,
+                        ]}>
+                        ›
+                      </Text>
+                      <Text
+                        style={[
+                          styles.toolbarCaption,
+                          currentPage === totalPages - 1 &&
+                            styles.toolbarCaptionDisabled,
+                        ]}>
+                        Next
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={styles.toolbarButton}
+                      onPress={() => goToAdjacentClozedPage(1)}
+                      disabled={!hasNextClozedPage}>
+                      <Text
+                        style={[
+                          styles.toolbarIcon,
+                          !hasNextClozedPage && styles.toolbarIconDisabled,
+                        ]}>
+                        »
+                      </Text>
+                      <Text
+                        style={[
+                          styles.toolbarCaption,
+                          !hasNextClozedPage && styles.toolbarCaptionDisabled,
+                        ]}>
+                        Cloze
+                      </Text>
+                    </TouchableOpacity>
+                  </>
+                )}
+                <View
+                  style={[
+                    styles.toolbarDivider,
+                    totalPages <= 1 && styles.toolbarDividerPush,
+                  ]}
+                />
+                <View style={styles.toolbarActionsGroup}>
                   <TouchableOpacity
-                    style={styles.pillButton}
+                    style={styles.toolbarButton}
                     onPress={clearCurrentPageClozes}
                     disabled={currentPageClozeCount === 0}>
                     <Text
                       style={[
-                        styles.pillButtonText,
+                        styles.toolbarIcon,
                         currentPageClozeCount === 0 &&
-                          styles.pillButtonTextDisabled,
+                          styles.toolbarIconDisabled,
+                      ]}>
+                      ⌫
+                    </Text>
+                    <Text
+                      style={[
+                        styles.toolbarCaption,
+                        currentPageClozeCount === 0 &&
+                          styles.toolbarCaptionDisabled,
                       ]}>
                       Clear
                     </Text>
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.pillButton}
-                    onPress={() => setShuffle(s => !s)}>
-                    <Text style={styles.pillButtonText}>
-                      Shuffle: {shuffle ? 'On' : 'Off'}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.pillButton}
-                    onPress={() => syncCurrentPage()}>
-                    <Text style={styles.pillButtonText}>Refresh</Text>
-                  </TouchableOpacity>
-                </>
-              ) : (
+                </View>
+              </>
+            ) : (
+              !atSummary && (
                 <>
-                  {!atSummary && (
+                  <View
+                    style={[styles.toolbarDivider, styles.toolbarDividerPush]}
+                  />
+                  <View style={styles.toolbarActionsGroup}>
                     <TouchableOpacity
-                      style={styles.pillButton}
+                      style={styles.toolbarButton}
                       onPress={resetCurrentQueue}>
-                      <Text style={styles.pillButtonText}>Reset</Text>
+                      <Text style={styles.toolbarIcon}>⟲</Text>
+                      <Text style={styles.toolbarCaption}>Reset</Text>
                     </TouchableOpacity>
-                  )}
-                  <TouchableOpacity
-                    style={styles.pillButton}
-                    onPress={() => setMode('edit')}>
-                    <Text style={styles.pillButtonText}>Exit Quiz</Text>
-                  </TouchableOpacity>
+                  </View>
                 </>
-              )}
-            </View>
+              )
+            )}
           </View>
-
-          {mode === 'edit' && totalPages > 1 && !loading && !error && (
-            <View style={styles.pageNavRow}>
-              <TouchableOpacity
-                style={styles.pageNavButton}
-                onPress={() => goToPage(-1)}
-                disabled={currentPage === 0}>
-                <Text
-                  style={[
-                    styles.pageNavButtonText,
-                    currentPage === 0 && styles.pillButtonTextDisabled,
-                  ]}>
-                  ‹ Prev Page
-                </Text>
-              </TouchableOpacity>
-              <Text style={[styles.pageNavText, {color: textColor}]}>
-                Page {currentPage + 1} / {totalPages}
-              </Text>
-              <TouchableOpacity
-                style={styles.pageNavButton}
-                onPress={() => goToPage(1)}
-                disabled={currentPage === totalPages - 1}>
-                <Text
-                  style={[
-                    styles.pageNavButtonText,
-                    currentPage === totalPages - 1 &&
-                      styles.pillButtonTextDisabled,
-                  ]}>
-                  Next Page ›
-                </Text>
-              </TouchableOpacity>
-            </View>
-          )}
 
           {loading && (
             <View style={styles.centerFill}>
@@ -1739,56 +1854,20 @@ function App(): React.JSX.Element {
             </View>
           )}
 
-          {!loading && !error && (
+          {!loading && !error && mode === 'quiz' && (
             <View style={styles.bottomBar}>
-              {mode === 'edit' ? (
-                <>
-                  <TouchableOpacity
-                    style={[styles.modeButton, styles.modeButtonActive]}>
-                    <Text
-                      style={[
-                        styles.modeButtonText,
-                        styles.modeButtonTextActive,
-                      ]}>
-                      Edit Clozes
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.modeButton}
-                    onPress={openQuizPicker}
-                    disabled={totalClozesAllPages === 0}>
-                    <Text
-                      style={[
-                        styles.modeButtonText,
-                        totalClozesAllPages === 0 &&
-                          styles.modeButtonTextDisabled,
-                      ]}>
-                      Quiz...
-                      {totalClozesAllPages > 0
-                        ? ` (${totalClozesAllPages})`
-                        : ''}
-                    </Text>
-                  </TouchableOpacity>
-                </>
-              ) : atSummary ? (
-                <>
-                  <TouchableOpacity
-                    style={styles.modeButton}
-                    onPress={restartQuiz}>
-                    <Text style={styles.modeButtonText}>Restart</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.modeButton}
-                    onPress={() => setMode('edit')}>
-                    <Text style={styles.modeButtonText}>Back to Edit</Text>
-                  </TouchableOpacity>
-                </>
+              {atSummary ? (
+                <TouchableOpacity
+                  style={styles.modeButton}
+                  onPress={restartQuiz}>
+                  <Text style={styles.modeButtonText}>Restart</Text>
+                </TouchableOpacity>
               ) : (
                 <View style={styles.quizControls}>
                   <View style={styles.quizStatsRow}>
                     <Text style={[styles.quizStatsText, {color: textColor}]}>
-                      ✓ {quizStats.known} · ✕ {quizStats.missed} · left{' '}
-                      {quizStats.total - quizStats.known - quizStats.missed}
+                      Card {quizIndex + 1}/{quizQueue.length} · ✓{' '}
+                      {quizStats.known} · ✕ {quizStats.missed}
                     </Text>
                   </View>
                   <View style={styles.quizButtonsRow}>
@@ -1847,6 +1926,15 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
+  noteBar: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+  },
+  noteBarText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
   topBar: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1855,12 +1943,15 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   iconButton: {
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    borderRadius: 16,
+    width: 50,
+    height: 50,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 4,
+    borderRadius: 10,
   },
   iconText: {
-    fontSize: 18,
+    fontSize: 24,
     fontWeight: '600',
   },
   title: {
@@ -1871,6 +1962,76 @@ const styles = StyleSheet.create({
   },
   topBarActions: {
     flexDirection: 'row',
+  },
+  toolbar: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingTop: 8,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+  },
+  toolbarActionsGroup: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+  },
+  toolbarDivider: {
+    width: 1,
+    height: 32,
+    backgroundColor: '#00000033',
+    marginHorizontal: 8,
+  },
+  toolbarDividerPush: {
+    marginLeft: 'auto',
+  },
+  toolbarButton: {
+    width: 50,
+    height: 50,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 4,
+    marginRight: 4,
+    marginBottom: 4,
+    borderRadius: 10,
+  },
+  toolbarIcon: {
+    fontSize: 32,
+    fontWeight: '600',
+    color: '#000000',
+  },
+  toolbarIconDisabled: {
+    color: '#aaaaaa',
+  },
+  toolbarCaption: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#000000',
+    marginTop: 2,
+  },
+  toolbarCaptionDisabled: {
+    color: '#aaaaaa',
+  },
+  toolbarPageText: {
+    fontSize: 14,
+    fontWeight: '600',
+    marginRight: 6,
+    marginBottom: 6,
+  },
+  tabButton: {
+    height: 50,
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    marginRight: 4,
+  },
+  tabText: {
+    fontSize: 19,
+    fontWeight: '500',
+  },
+  tabTextActive: {
+    fontWeight: '700',
+    textDecorationLine: 'underline',
   },
   pillButton: {
     borderWidth: 1,
@@ -1888,26 +2049,6 @@ const styles = StyleSheet.create({
   },
   pillButtonTextDisabled: {
     color: '#aaaaaa',
-  },
-  pageNavRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingBottom: 8,
-  },
-  pageNavButton: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-  },
-  pageNavButtonText: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#000000',
-  },
-  pageNavText: {
-    fontSize: 13,
-    fontWeight: '600',
-    marginHorizontal: 10,
   },
   centerFill: {
     flex: 1,
@@ -2105,16 +2246,10 @@ const styles = StyleSheet.create({
     marginHorizontal: 4,
     borderRadius: 18,
   },
-  modeButtonActive: {
-    backgroundColor: '#000000',
-  },
   modeButtonText: {
     fontSize: 14,
     fontWeight: '600',
     color: '#000000',
-  },
-  modeButtonTextActive: {
-    color: '#ffffff',
   },
   modeButtonTextDisabled: {
     color: '#aaaaaa',
