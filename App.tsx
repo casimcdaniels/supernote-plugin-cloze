@@ -21,6 +21,7 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Image,
   PanResponder,
   Pressable,
@@ -40,6 +41,10 @@ import {
   PluginFileAPI,
   PluginManager,
 } from 'sn-plugin-lib';
+
+// Wraps TouchableOpacity so its style prop (border color/width) can be driven
+// by an Animated.Value for the quiz's blinking-active-cloze indicator.
+const AnimatedTouchableOpacity = Animated.createAnimatedComponent(TouchableOpacity);
 
 type Mode = 'edit' | 'quiz';
 type Grade = 'unseen' | 'known' | 'missed';
@@ -163,6 +168,32 @@ function App(): React.JSX.Element {
   const pluginDirRef = useRef<string | null>(null);
   const containerSize = useRef({width: 0, height: 0});
   const startPoint = useRef({x: 0, y: 0});
+  // Drives a slow, continuous pulse on the active quiz cloze's border so it
+  // reads clearly next to the other flat black hidden clozes. Runs for the
+  // life of the component; only the "current" cloze's style consumes it.
+  const blinkAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(blinkAnim, {
+          toValue: 1,
+          duration: 900,
+          useNativeDriver: false,
+        }),
+        Animated.timing(blinkAnim, {
+          toValue: 0,
+          duration: 900,
+          useNativeDriver: false,
+        }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [blinkAnim]);
+  const blinkBorderColor = blinkAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['#ffffff', '#000000'],
+  });
   // Everything persisted for the open note. This includes decks plus clozes for every
   // known marker uuid, not just the pages we've visited this session like
   // pages below. Loaded once per note, then kept up to date as we go.
@@ -1668,17 +1699,18 @@ function App(): React.JSX.Element {
 
                   if (isCurrent) {
                     return (
-                      <TouchableOpacity
+                      <AnimatedTouchableOpacity
                         key={box.id}
                         style={[
                           styles.hiddenBox,
                           styles.focusedHiddenBox,
                           style,
+                          {borderColor: blinkBorderColor},
                         ]}
                         onPress={revealCurrentCard}
                         activeOpacity={0.85}>
                         <Text style={styles.hiddenBoxText}>?</Text>
-                      </TouchableOpacity>
+                      </AnimatedTouchableOpacity>
                     );
                   }
 
@@ -2056,7 +2088,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   focusedHiddenBox: {
-    borderWidth: 3,
+    borderWidth: 4,
     borderColor: '#ffffff',
   },
   hiddenBoxText: {
