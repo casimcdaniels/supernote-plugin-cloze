@@ -41,6 +41,60 @@ import {
   PluginManager,
 } from 'sn-plugin-lib';
 
+// Diagonal black/white hazard-stripe fill for hidden (non-active) quiz
+// clozes, built from plain Views instead of an image asset — a rotated row
+// of alternating bars clipped to the box's own bounds. Bar width is a fixed
+// pixel value rather than a percentage, so stripes stay the same physical
+// size whether the cloze is a single word or half the page; we measure the
+// box via onLayout and compute how many bars are needed to cover it.
+const STRIPE_BAR_PX = 4;
+function DiagonalStripes() {
+  const [size, setSize] = useState<{width: number; height: number} | null>(
+    null,
+  );
+  return (
+    <View
+      style={styles.stripesClip}
+      onLayout={e => {
+        const {width, height} = e.nativeEvent.layout;
+        setSize({width, height});
+      }}>
+      {size &&
+        (() => {
+          // A square this size, centered and rotated by any angle, always
+          // fully covers the box: the box's own diagonal is the worst case.
+          const cover =
+            Math.ceil(Math.sqrt(size.width ** 2 + size.height ** 2)) +
+            STRIPE_BAR_PX * 2;
+          const barCount = Math.ceil(cover / STRIPE_BAR_PX);
+          return (
+            <View
+              style={{
+                position: 'absolute',
+                width: cover,
+                height: cover,
+                left: (size.width - cover) / 2,
+                top: (size.height - cover) / 2,
+                flexDirection: 'row',
+                transform: [{rotate: '45deg'}],
+              }}>
+              {Array.from({length: barCount}).map((_, i) => (
+                <View
+                  key={i}
+                  style={{
+                    width: STRIPE_BAR_PX,
+                    height: cover,
+                    backgroundColor: i % 2 === 0 ? '#000000' : '#ffffff',
+                  }}
+                />
+              ))}
+            </View>
+          );
+        })()}
+    </View>
+  );
+}
+
 type Mode = 'edit' | 'quiz';
 type Grade = 'unseen' | 'known' | 'missed';
 type Screen = 'editor' | 'library' | 'decks' | 'quizPicker';
@@ -1670,15 +1724,10 @@ function App(): React.JSX.Element {
                     return (
                       <TouchableOpacity
                         key={box.id}
-                        style={[
-                          styles.hiddenBox,
-                          styles.focusedHiddenBox,
-                          style,
-                        ]}
+                        style={[styles.hiddenBox, styles.focusedHiddenBox, style]}
                         onPress={revealCurrentCard}
-                        activeOpacity={0.85}>
-                        <Text style={styles.hiddenBoxText}>?</Text>
-                      </TouchableOpacity>
+                        activeOpacity={0.85}
+                      />
                     );
                   }
 
@@ -1686,8 +1735,9 @@ function App(): React.JSX.Element {
                     <View
                       key={box.id}
                       pointerEvents="none"
-                      style={[styles.hiddenBox, style]}
-                    />
+                      style={[styles.hiddenBox, style]}>
+                      <DiagonalStripes />
+                    </View>
                   );
                 })}
 
@@ -2051,18 +2101,14 @@ const styles = StyleSheet.create({
   },
   hiddenBox: {
     position: 'absolute',
-    backgroundColor: '#000000',
-    alignItems: 'center',
-    justifyContent: 'center',
   },
   focusedHiddenBox: {
-    borderWidth: 3,
-    borderColor: '#ffffff',
+    backgroundColor: '#000000',
   },
-  hiddenBoxText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '700',
+  stripesClip: {
+    ...StyleSheet.absoluteFillObject,
+    overflow: 'hidden',
+    backgroundColor: '#ffffff',
   },
   revealedBox: {
     position: 'absolute',
