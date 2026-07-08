@@ -5,13 +5,14 @@
  * organized into named decks, then quiz yourself by tapping boxes one at a
  * time to reveal what's underneath and grading yourself.
  *
- * Cloze boxes (position + grade + deck, keyed per page) and the note's deck
- * list are persisted to disk via AsyncStorage under a key derived from the
- * note's file path, so a deck survives closing and reopening the plugin.
- * Page snapshots themselves are never persisted — they're cheap to
- * regenerate on demand and can go stale if the note changes. They are not
- * written back into the note itself (aside from a tiny off-canvas per-page
- * marker used purely to track pages across reorder/insert/delete).
+ * We track which page is which by planting a tiny invisible text marker on
+ * a page the first time it gets clozed, and storing clozes under that
+ * marker's uuid instead of the page number. That way, if pages get
+ * reordered, inserted, or deleted, we don't have to go figure out where
+ * everything moved to — we just read whatever marker is on the page we're
+ * looking at. We only ever check the current page; other pages get checked
+ * lazily as the user pages through. Page snapshots themselves aren't saved
+ * anywhere, they're cheap enough to just regenerate whenever we need one.
  *
  * @format
  */
@@ -67,24 +68,16 @@ interface ClozeBox {
   deckId: string;
 }
 
-interface PageAnchor {
-  // Unique marker string embedded as the content of a tiny text element we plant
-  // just off-canvas past the page's bottom-right corner. It's self-labeled
-  // ("CLOZE:xxxx") rather than relying on the native-assigned element uuid, so
-  // it reads as an obvious, harmless plugin artifact if it's ever spotted
-  // (e.g. if the off-canvas assumption turns out wrong), not a stray mark.
-  token: string;
-}
-
 interface PageState {
   imageUri: string | null;
   aspectRatio: number;
   clozes: ClozeBox[];
-  // Content-anchored "page ID" so clozes can be relocated if the note's pages
-  // get reordered/inserted/deleted — the SDK only exposes a plain 0-based page
-  // index, never a stable page ID. Null if planting the marker failed (falls
-  // back to trusting the index for that page).
-  anchor: PageAnchor | null;
+  // UUID for this page's marker element, or null if never clozed. Clozes
+  // are looked up/persisted by this UUID, not by page index since
+  // reordering/deletion of pages changes index.
+  markerUuid: string | null;
+  // Whether the marker lookup has run yet this session.
+  identityChecked: boolean;
 }
 
 interface DraftRect {
@@ -103,40 +96,37 @@ type PersistedClozeBox = Pick<
   ClozeBox,
   'id' | 'x' | 'y' | 'width' | 'height' | 'grade' | 'deckId'
 >;
-interface PersistedPageEntry {
-  anchor: PageAnchor | null;
-  clozes: PersistedClozeBox[];
-}
 interface PersistedNoteData {
   decks: Deck[];
-  pages: Record<number, PersistedPageEntry>;
+  // Keyed by marker UUID — see PageState.markerUuid.
+  pagesByUuid: Record<string, PersistedClozeBox[]>;
 }
 
 const MIN_BOX_PX = 14;
 // Must match the sidebar button's id in index.js's PluginManager.registerButton call.
 const CLOZE_BUTTON_ID = 100;
-const STORAGE_PREFIX = 'clozequiz:v4:';
-const ANCHOR_TOKEN_PREFIX = 'CLOZE:';
-// Marker size, and how far past the page's actual pixel bounds to plant it
-// (bottom-right corner, just off-canvas), in page pixels.
-const ANCHOR_MARGIN = 20;
-const ANCHOR_SIZE = 40;
+const STORAGE_PREFIX = 'clozequiz:v6:';
 const DEFAULT_DECK_ID = 'default';
 const DEFAULT_DECK_NAME = 'Default';
 const DEFAULT_DECKS: Deck[] = [{id: DEFAULT_DECK_ID, name: DEFAULT_DECK_NAME}];
+
+// Prefix so the marker reads as an obvious plugin artifact if ever spotted,
+// and the UUID can just be sliced off the end.
+const MARKER_PREFIX = 'CLOZEID:';
+// How far past the page's bottom-right corner to plant the marker, in pixels.
+const MARKER_MARGIN = 20;
+const MARKER_SIZE = 40;
 
 function storageKeyForNote(notePath: string): string {
   return `${STORAGE_PREFIX}${notePath}`;
 }
 
-function newAnchorToken(): string {
-  return `${ANCHOR_TOKEN_PREFIX}${Date.now().toString(36)}${Math.random()
-    .toString(36)
-    .slice(2, 8)}`;
-}
-
 function newDeckId(): string {
   return `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function newMarkerUuid(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function App(): React.JSX.Element {
@@ -173,9 +163,19 @@ function App(): React.JSX.Element {
   const pluginDirRef = useRef<string | null>(null);
   const containerSize = useRef({width: 0, height: 0});
   const startPoint = useRef({x: 0, y: 0});
+  // Everything persisted for the open note. This includes decks plus clozes for every
+  // known marker uuid, not just the pages we've visited this session like
+  // pages below. Loaded once per note, then kept up to date as we go.
+  const persistedDataRef = useRef<PersistedNoteData | null>(null);
 
   const pagesRef = useRef<Record<number, PageState>>({});
   pagesRef.current = pages;
+  // Tracks which pages we've already looked up (or are looking up) a marker
+  // for this session, so we don't fire off the same getElements call twice.
+  const pageIdentityRequestedRef = useRef<Set<number>>(new Set());
+  // This ref tops us from firing two insertElements calls if the user draws a couple clozes on a fresh page
+  // quickly. We clear a page out of here if the plant fails, so it can retry.
+  const markerPlantRequestedRef = useRef<Set<number>>(new Set());
   const currentPageRef = useRef(currentPage);
   currentPageRef.current = currentPage;
   const totalPagesRef = useRef(totalPages);
@@ -235,7 +235,8 @@ function App(): React.JSX.Element {
           imageUri: null,
           aspectRatio,
           clozes: [],
-          anchor: null,
+          markerUuid: null,
+          identityChecked: false,
         };
         return {
           ...prev,
@@ -247,51 +248,10 @@ function App(): React.JSX.Element {
     }
   }, []);
 
-  // Finds our marker text element on a page by its token, if one exists there.
-  const findAnchorElement = useCallback(
-    async (
-      notePath: string,
-      page: number,
-      token: string,
-    ): Promise<{num: number} | null> => {
-      try {
-        const res: any = await PluginFileAPI.getElements(page, notePath);
-        const elements = res?.success ? res.result : null;
-        if (!Array.isArray(elements)) {
-          return null;
-        }
-        const match = elements.find(
-          (el: any) =>
-            el?.type === Element.TYPE_TEXT &&
-            el?.textBox?.textContentFull === token,
-        );
-        if (!match) {
-          return null;
-        }
-        return {num: match.numInPage};
-      } catch (e) {
-        return null;
-      }
-    },
-    [],
-  );
-
-  // Best-effort: plant a tiny, self-labeled text marker ("CLOZE:xxxx") just past
-  // the page's bottom-right corner (off-canvas — outside the page's actual pixel
-  // bounds, so it shouldn't render or be reachable by lasso/select-all), and use
-  // its own content as a stable "page ID". Degrades to null (index-trust only)
-  // if any step fails — never throws, since this must not be able to break
-  // editing/studying.
-  //
-  // Uses PluginCommAPI.createElement + PluginFileAPI.insertElements (the
-  // officially-documented pattern — a hand-built plain object literal was
-  // rejected natively) rather than PluginNoteAPI.insertText, because insertText
-  // has no notePath/page params: per the docs it only affects whatever page is
-  // actually on-screen in the live note, which can differ from `page` here
-  // since our own Prev/Next Page buttons browse independently of the live note.
-  // insertElements takes an explicit page, so this works for any page.
-  const ensurePageAnchor = useCallback(
-    async (notePath: string, page: number): Promise<PageAnchor | null> => {
+  // This function places a text marker outside of page margins and
+  // uses its content as a stable id we can look the page up by later.
+  const plantPageMarker = useCallback(
+    async (notePath: string, page: number): Promise<string | null> => {
       try {
         const sizeRes: any = await PluginFileAPI.getPageSize(notePath, page);
         if (
@@ -301,9 +261,9 @@ function App(): React.JSX.Element {
         ) {
           return null;
         }
-        const left = sizeRes.result.width + ANCHOR_MARGIN;
-        const top = sizeRes.result.height + ANCHOR_MARGIN;
-        const token = newAnchorToken();
+        const left = sizeRes.result.width + MARKER_MARGIN;
+        const top = sizeRes.result.height + MARKER_MARGIN;
+        const uuid = newMarkerUuid();
 
         const createRes: any = await PluginCommAPI.createElement(
           Element.TYPE_TEXT,
@@ -316,12 +276,12 @@ function App(): React.JSX.Element {
         element.layerNum = 0;
         element.textBox = {
           ...(element.textBox ?? {}),
-          textContentFull: token,
+          textContentFull: `${MARKER_PREFIX}${uuid}`,
           textRect: {
             left,
             top,
-            right: left + ANCHOR_SIZE,
-            bottom: top + ANCHOR_SIZE,
+            right: left + MARKER_SIZE,
+            bottom: top + MARKER_SIZE,
           },
           fontSize: 8,
           textAlign: 0,
@@ -340,33 +300,78 @@ function App(): React.JSX.Element {
         if (!insertRes?.success || !insertRes?.result) {
           return null;
         }
-
-        const found = await findAnchorElement(notePath, page, token);
-        return found ? {token} : null;
+        return uuid;
       } catch (e) {
         return null;
       }
     },
-    [findAnchorElement],
+    [],
   );
 
-  // Best-effort: remove the marker element once a page's clozes are cleared.
-  const deletePageAnchor = useCallback(
-    async (notePath: string, page: number, anchor: PageAnchor) => {
+  const readPageMarkerUuid = useCallback(
+    async (notePath: string, page: number): Promise<string | null> => {
       try {
-        const found = await findAnchorElement(notePath, page, anchor.token);
-        if (found) {
-          await PluginFileAPI.deleteElements(notePath, page, [found.num]);
+        const res: any = await PluginFileAPI.getElements(page, notePath);
+        const elements = res?.success ? res.result : null;
+        if (!Array.isArray(elements)) {
+          return null;
         }
+        const marker = elements.find(
+          (el: any) =>
+            el?.type === Element.TYPE_TEXT &&
+            typeof el?.textBox?.textContentFull === 'string' &&
+            el.textBox.textContentFull.startsWith(MARKER_PREFIX),
+        );
+        return marker
+          ? marker.textBox.textContentFull.slice(MARKER_PREFIX.length)
+          : null;
       } catch (e) {
-        // Nothing more we can do — worst case a stray marker lingers in the corner.
+        return null;
       }
     },
-    [findAnchorElement],
+    [],
   );
 
-  // Scans every note with saved cloze data (not just the currently open one)
-  // for the library screen.
+  // Loads a page's marker and clozes into state. We only do this once per
+  // page per session; if no marker turns up we just clear out any clozes
+  // that were sitting in that page slot.
+  const loadPageIdentity = useCallback(
+    async (page: number) => {
+      const notePath = notePathRef.current;
+      if (!notePath || pageIdentityRequestedRef.current.has(page)) {
+        return;
+      }
+      pageIdentityRequestedRef.current.add(page);
+      const uuid = await readPageMarkerUuid(notePath, page);
+      const clozes = uuid
+        ? (persistedDataRef.current?.pagesByUuid[uuid] ?? []).map(b => ({
+            ...b,
+            revealed: false,
+          }))
+        : [];
+      setPages(prev => {
+        const existing = prev[page] ?? {
+          imageUri: null,
+          aspectRatio: 0.75,
+          clozes: [],
+          markerUuid: null,
+          identityChecked: false,
+        };
+        return {
+          ...prev,
+          [page]: {
+            ...existing,
+            markerUuid: uuid,
+            clozes,
+            identityChecked: true,
+          },
+        };
+      });
+    },
+    [readPageMarkerUuid],
+  );
+
+  // Scans every note with saved cloze data for the library screen.
   const loadLibrary = useCallback(async () => {
     setLibraryLoading(true);
     try {
@@ -382,10 +387,10 @@ function App(): React.JSX.Element {
           const parsed = JSON.parse(raw) as PersistedNoteData;
           let pageCount = 0;
           let clozeCount = 0;
-          for (const entry of Object.values(parsed.pages ?? {})) {
-            if (entry?.clozes?.length) {
+          for (const clozes of Object.values(parsed.pagesByUuid ?? {})) {
+            if (clozes?.length) {
               pageCount++;
-              clozeCount += entry.clozes.length;
+              clozeCount += clozes.length;
             }
           }
           if (pageCount > 0) {
@@ -408,38 +413,20 @@ function App(): React.JSX.Element {
     }
   }, []);
 
-  // Removes ALL of a note's saved data (every deck): best-effort cleanup of
-  // each page's off-canvas marker element (works for any note, not just the
-  // currently open one — the underlying APIs take an explicit notePath/page),
-  // then drops the storage entry. If it's the note currently open in the
-  // editor, resets live state too so the persist-on-change effect doesn't
-  // immediately write the data back.
-  const deleteNoteData = useCallback(
-    async (notePath: string) => {
-      const key = storageKeyForNote(notePath);
-      try {
-        const raw = await AsyncStorage.getItem(key);
-        if (raw) {
-          const parsed = JSON.parse(raw) as PersistedNoteData;
-          for (const [pageStr, entry] of Object.entries(parsed.pages ?? {})) {
-            if (entry?.anchor) {
-              await deletePageAnchor(notePath, Number(pageStr), entry.anchor);
-            }
-          }
-        }
-      } catch (e) {
-        // Best effort — still remove the storage entry below regardless.
-      }
-      await AsyncStorage.removeItem(key);
-      if (notePath === notePathRef.current) {
-        setPages({});
-        setDecks(DEFAULT_DECKS);
-        setActiveDeckId(DEFAULT_DECK_ID);
-      }
-      setLibrary(prev => prev.filter(n => n.notePath !== notePath));
-    },
-    [deletePageAnchor],
-  );
+  // Wipes all saved cloze data for a note. Fingerprint marker is
+  // left note alone if one exists.
+  const deleteNoteData = useCallback(async (notePath: string) => {
+    const key = storageKeyForNote(notePath);
+    await AsyncStorage.removeItem(key);
+    if (notePath === notePathRef.current) {
+      setPages({});
+      pageIdentityRequestedRef.current.clear();
+      persistedDataRef.current = {decks: DEFAULT_DECKS, pagesByUuid: {}};
+      setDecks(DEFAULT_DECKS);
+      setActiveDeckId(DEFAULT_DECK_ID);
+    }
+    setLibrary(prev => prev.filter(n => n.notePath !== notePath));
+  }, []);
 
   const confirmDeleteNoteData = useCallback(
     (note: NoteSummary) => {
@@ -465,165 +452,38 @@ function App(): React.JSX.Element {
     [deleteNoteData],
   );
 
-  const restorePersistedClozes = useCallback(
-    async (notePath: string): Promise<Record<number, PageState>> => {
-      try {
-        const raw = await AsyncStorage.getItem(storageKeyForNote(notePath));
-        if (!raw) {
-          setDecks(DEFAULT_DECKS);
-          setActiveDeckId(DEFAULT_DECK_ID);
-          return {};
-        }
-        const parsed = JSON.parse(raw) as PersistedNoteData;
-        const restoredDecks =
-          Array.isArray(parsed.decks) && parsed.decks.length > 0
-            ? parsed.decks
-            : DEFAULT_DECKS;
-        setDecks(restoredDecks);
-        // Only reset the active deck if the current selection doesn't exist in
-        // this note's deck list (e.g. this is a genuinely different note, or
-        // first load) — otherwise a resync (Refresh, reopening the plugin,
-        // etc.) would silently revert whichever deck the user had switched to.
-        setActiveDeckId(prev =>
-          restoredDecks.some(d => d.id === prev) ? prev : restoredDecks[0].id,
-        );
-
-        const restored: Record<number, PageState> = {};
-        for (const [pageStr, entry] of Object.entries(parsed.pages ?? {})) {
-          if (
-            !entry ||
-            !Array.isArray(entry.clozes) ||
-            entry.clozes.length === 0
-          ) {
-            continue;
-          }
-          restored[Number(pageStr)] = {
-            imageUri: null,
-            aspectRatio: 0.75,
-            anchor: entry.anchor ?? null,
-            clozes: entry.clozes.map(b => ({
-              ...b,
-              deckId: b.deckId ?? DEFAULT_DECK_ID,
-              revealed: false,
-            })),
-          };
-        }
-        if (Object.keys(restored).length === 0) {
-          return {};
-        }
-        // In-memory state (if any already loaded this session) wins over the restored copy.
-        setPages(prev => ({...restored, ...prev}));
-        return restored;
-      } catch (e) {
-        // Corrupt or missing storage entry — just start with an empty deck.
+  // Pulls the note's saved decks and clozes into persistedDataRef.
+  const loadPersistedNoteData = useCallback(async (notePath: string) => {
+    try {
+      const raw = await AsyncStorage.getItem(storageKeyForNote(notePath));
+      if (!raw) {
+        persistedDataRef.current = {decks: DEFAULT_DECKS, pagesByUuid: {}};
         setDecks(DEFAULT_DECKS);
         setActiveDeckId(DEFAULT_DECK_ID);
-        return {};
-      }
-    },
-    [],
-  );
-
-  // For every clozed page with an anchor, confirm its marker element is still at
-  // that index; if not (pages reordered/inserted/deleted since), sweep the rest
-  // of the note for it and relocate the clozes. Pages without an anchor (no free
-  // layer slot when first clozed) are left as-is — index is all we have for them.
-  const reconcilePagesByAnchor = useCallback(
-    async (seed: Record<number, PageState>) => {
-      const notePath = notePathRef.current;
-      if (!notePath) {
         return;
       }
-
-      const basePages: Record<number, PageState> = {
-        ...seed,
-        ...pagesRef.current,
+      const parsed = JSON.parse(raw) as PersistedNoteData;
+      const restoredDecks =
+        Array.isArray(parsed.decks) && parsed.decks.length > 0
+          ? parsed.decks
+          : DEFAULT_DECKS;
+      persistedDataRef.current = {
+        decks: restoredDecks,
+        pagesByUuid: parsed.pagesByUuid ?? {},
       };
-      const clozedEntries = Object.entries(basePages)
-        .map(([p, ps]) => [Number(p), ps] as [number, PageState])
-        .filter(([, ps]) => ps.clozes.length > 0);
-      if (clozedEntries.length === 0) {
-        return;
-      }
-
-      const needsRelocation: Array<{oldPage: number; ps: PageState}> = [];
-      const confirmed = new Set<number>();
-
-      for (const [page, ps] of clozedEntries) {
-        if (!ps.anchor) {
-          confirmed.add(page); // Nothing to check against — trust the index.
-          continue;
-        }
-        if (page >= totalPagesRef.current) {
-          needsRelocation.push({oldPage: page, ps});
-          continue;
-        }
-        const found = await findAnchorElement(notePath, page, ps.anchor.token);
-        if (found) {
-          confirmed.add(page);
-        } else {
-          needsRelocation.push({oldPage: page, ps});
-        }
-      }
-
-      if (needsRelocation.length === 0) {
-        return;
-      }
-
-      const claimed = new Set(confirmed);
-      const relocations: Array<{
-        oldPage: number;
-        newPage: number;
-        ps: PageState;
-      }> = [];
-      for (const entry of needsRelocation) {
-        const anchor = entry.ps.anchor!;
-        let found: number | null = null;
-        for (let p = 0; p < totalPagesRef.current; p++) {
-          if (claimed.has(p) || relocations.some(r => r.newPage === p)) {
-            continue;
-          }
-          const match = await findAnchorElement(notePath, p, anchor.token);
-          if (match) {
-            found = p;
-            break;
-          }
-        }
-        if (found !== null) {
-          relocations.push({
-            oldPage: entry.oldPage,
-            newPage: found,
-            ps: entry.ps,
-          });
-          claimed.add(found);
-        }
-      }
-
-      if (relocations.length === 0) {
-        return;
-      }
-
-      setPages(prev => {
-        const next = {...prev};
-        for (const {oldPage} of needsRelocation) {
-          if (next[oldPage]) {
-            next[oldPage] = {...next[oldPage], clozes: [], anchor: null};
-          }
-        }
-        for (const {newPage, ps} of relocations) {
-          const existingImage = next[newPage];
-          next[newPage] = {
-            imageUri: existingImage?.imageUri ?? null,
-            aspectRatio: existingImage?.aspectRatio ?? ps.aspectRatio,
-            clozes: ps.clozes,
-            anchor: ps.anchor,
-          };
-        }
-        return next;
-      });
-    },
-    [findAnchorElement],
-  );
+      setDecks(restoredDecks);
+      // Only reset if the current selection doesn't exist in this note's deck
+      // list — otherwise a resync would silently revert the user's switch.
+      setActiveDeckId(prev =>
+        restoredDecks.some(d => d.id === prev) ? prev : restoredDecks[0].id,
+      );
+    } catch (e) {
+      // Corrupt or missing storage entry — just start with an empty deck.
+      persistedDataRef.current = {decks: DEFAULT_DECKS, pagesByUuid: {}};
+      setDecks(DEFAULT_DECKS);
+      setActiveDeckId(DEFAULT_DECK_ID);
+    }
+  }, []);
 
   const syncCurrentPage = useCallback(async () => {
     setLoading(true);
@@ -660,48 +520,47 @@ function App(): React.JSX.Element {
       totalPagesRef.current = totalPagesValue;
 
       if (previousNotePath !== notePath) {
-        // Switched to a different note (or first load) — the previous note's
-        // clozes/decks must not leak into this one.
+        // Different note than what we had open before, so wipe everything
+        // rather than risk leaking the old note's clozes/decks into this one.
         setPages({});
+        pageIdentityRequestedRef.current.clear();
       } else {
-        // Any cached page snapshot could now belong to different content — pages
-        // may have been inserted/deleted/reordered in the note since we last
-        // looked (e.g. the plugin's JS context surviving a close+reopen without a
-        // fresh mount). Drop every cached image so revisited pages re-render from
-        // scratch instead of showing stale content under the wrong index. Clozes
-        // aren't touched here — reconcilePagesByAnchor below handles relocating
-        // those independently via each page's own anchor marker.
+        // Same note, but it might have changed while we were closed, so drop
+        // the cached page images and re-check every page's marker next time
+        // we visit it.
+        pageIdentityRequestedRef.current.clear();
         setPages(prev => {
           const next: Record<number, PageState> = {};
           for (const [pStr, ps] of Object.entries(prev)) {
-            next[Number(pStr)] = {...ps, imageUri: null};
+            next[Number(pStr)] = {
+              ...ps,
+              imageUri: null,
+              identityChecked: false,
+            };
           }
           return next;
         });
       }
 
-      const restored = await restorePersistedClozes(notePath);
-      await reconcilePagesByAnchor(restored);
+      await loadPersistedNoteData(notePath);
+      // We only check the current page's marker here. Other pages get
+      // checked lazily as the user pages through, in goToPage.
+      await loadPageIdentity(page);
       await loadPageSnapshot(page, true);
     } catch (e) {
       setError('Something went wrong loading the page.');
     } finally {
       setLoading(false);
     }
-  }, [loadPageSnapshot, restorePersistedClozes, reconcilePagesByAnchor]);
+  }, [loadPageSnapshot, loadPersistedNoteData, loadPageIdentity]);
 
   useEffect(() => {
     syncCurrentPage();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // The plugin's JS context/React tree appears to only ever mount once, the
-  // first time the sidebar button is tapped — reopening it later just re-shows
-  // the same instance rather than remounting, so the effect above never fires
-  // again and note edits made while "closed" are never picked up automatically.
-  // `onStart`/`onStop` plugin-life events didn't reliably fire on re-open
-  // either. The one signal that's guaranteed to fire every time the user
-  // (re)opens this plugin is the sidebar button press itself.
+  // The plugin only mounts once per JS lifetime, so just opening it again
+  // doesn't remount and rerun the effect above.
   useEffect(() => {
     const sub = PluginManager.registerButtonListener({
       onButtonPress: (event: any) => {
@@ -714,20 +573,27 @@ function App(): React.JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Persist decks + cloze positions/grades (not images, not `revealed`) whenever they change.
+  // Save decks and cloze positions/grades whenever they change. We merge our
+  // changes into persistedDataRef instead of overwriting it wholesale,
+  // because `pages` only knows about the pages we've visited this session —
+  // clozes for other uuids need to stay put.
   useEffect(() => {
     const notePath = notePathRef.current;
-    if (!notePath) {
+    const data = persistedDataRef.current;
+    if (!notePath || !data) {
       return;
     }
-    const toSavePages: Record<number, PersistedPageEntry> = {};
-    for (const [pageStr, ps] of Object.entries(pages)) {
-      if (ps.clozes.length === 0) {
+    data.decks = decks;
+    for (const ps of Object.values(pages)) {
+      if (!ps.markerUuid) {
         continue;
       }
-      toSavePages[Number(pageStr)] = {
-        anchor: ps.anchor,
-        clozes: ps.clozes.map(({id, x, y, width, height, grade, deckId}) => ({
+      if (ps.clozes.length === 0) {
+        delete data.pagesByUuid[ps.markerUuid];
+        continue;
+      }
+      data.pagesByUuid[ps.markerUuid] = ps.clozes.map(
+        ({id, x, y, width, height, grade, deckId}) => ({
           id,
           x,
           y,
@@ -735,13 +601,12 @@ function App(): React.JSX.Element {
           height,
           grade,
           deckId,
-        })),
-      };
+        }),
+      );
     }
-    const toSave: PersistedNoteData = {decks, pages: toSavePages};
     AsyncStorage.setItem(
       storageKeyForNote(notePath),
-      JSON.stringify(toSave),
+      JSON.stringify(data),
     ).catch(() => {});
   }, [pages, decks]);
 
@@ -751,12 +616,13 @@ function App(): React.JSX.Element {
       return;
     }
     setCurrentPage(next);
+    loadPageIdentity(next);
     if (!pagesRef.current[next]?.imageUri) {
       loadPageSnapshot(next);
     }
   };
 
-  // Pages that have at least one cloze in the active deck — used to jump
+  // Pages that have at least one cloze in the active deck. This is used to jump
   // straight between clozed pages instead of stepping one page at a time.
   const clozedPagesForActiveDeck = useMemo(
     () =>
@@ -790,8 +656,8 @@ function App(): React.JSX.Element {
     if (!width || !height) {
       return false;
     }
-    // Only the active deck's boxes are shown/interactive in edit mode, so only
-    // those should block starting a new draft rect underneath them.
+    // Only boxes from the active deck are shown in edit mode, so those are
+    // the only ones that should stop a new draft rect from starting here.
     const clozes = (
       pagesRef.current[currentPageRef.current]?.clozes ?? []
     ).filter(box => box.deckId === activeDeckIdRef.current);
@@ -804,9 +670,10 @@ function App(): React.JSX.Element {
     });
   };
 
-  // Recreated only when mode changes; reads current page/cloze/deck data
-  // through refs at call time so it never acts on stale state (see prior bug
-  // where this was built once via useRef and froze `mode` at its initial value).
+  // We only rebuild this when mode changes, and read page/cloze/deck data
+  // through refs at call time so it's never working off stale state. We got
+  // burned by this before, when it was built once with useRef and ended up
+  // stuck on whatever mode was at mount time.
   const panResponder = useMemo(
     () =>
       PanResponder.create({
@@ -856,34 +723,48 @@ function App(): React.JSX.Element {
                 deckId: activeDeckIdRef.current,
               };
               const page = currentPageRef.current;
-              let hadAnchor = false;
               setPages(prevPages => {
                 const existing = prevPages[page] ?? {
                   imageUri: null,
                   aspectRatio: 0.75,
                   clozes: [],
-                  anchor: null,
+                  markerUuid: null,
+                  identityChecked: false,
                 };
-                hadAnchor = !!existing.anchor;
                 return {
                   ...prevPages,
                   [page]: {...existing, clozes: [...existing.clozes, box]},
                 };
               });
-              // First cloze on this page this session — try to plant a page anchor
-              // so it can survive reordering. Fire-and-forget; degrades silently.
-              if (!hadAnchor && notePathRef.current) {
+              // If this is the first cloze on the page, plant a marker so it
+              // can survive reordering later. We wait for the identity check
+              // to confirm there's no marker yet, otherwise we could end up
+              // planting a second one while the read is still in flight.
+              if (
+                pagesRef.current[page]?.identityChecked &&
+                !pagesRef.current[page]?.markerUuid &&
+                !markerPlantRequestedRef.current.has(page) &&
+                notePathRef.current
+              ) {
+                markerPlantRequestedRef.current.add(page);
                 const notePath = notePathRef.current;
-                ensurePageAnchor(notePath, page).then(anchor => {
-                  if (!anchor) {
+                plantPageMarker(notePath, page).then(uuid => {
+                  if (!uuid) {
+                    markerPlantRequestedRef.current.delete(page); // allow retry
                     return;
+                  }
+                  if (persistedDataRef.current) {
+                    persistedDataRef.current.pagesByUuid[uuid] = [];
                   }
                   setPages(prevPages => {
                     const existing = prevPages[page];
-                    if (!existing || existing.anchor) {
+                    if (!existing || existing.markerUuid) {
                       return prevPages;
                     }
-                    return {...prevPages, [page]: {...existing, anchor}};
+                    return {
+                      ...prevPages,
+                      [page]: {...existing, markerUuid: uuid},
+                    };
                   });
                 });
               }
@@ -892,55 +773,31 @@ function App(): React.JSX.Element {
           });
         },
       }),
-    [mode, ensurePageAnchor],
+    [mode, plantPageMarker],
   );
 
   const removeCloze = (id: string) => {
     const page = currentPage;
-    let clearedAnchor: PageAnchor | null = null;
     setPages(prev => {
       const existing = prev[page];
       if (!existing) {
         return prev;
       }
       const clozes = existing.clozes.filter(c => c.id !== id);
-      const anchorCleared = clozes.length === 0 ? null : existing.anchor;
-      if (clozes.length === 0 && existing.anchor) {
-        clearedAnchor = existing.anchor;
-      }
-      return {...prev, [page]: {...existing, clozes, anchor: anchorCleared}};
+      return {...prev, [page]: {...existing, clozes}};
     });
-    if (clearedAnchor && notePathRef.current) {
-      deletePageAnchor(notePathRef.current, page, clearedAnchor);
-    }
   };
 
-  // Clears only the active deck's clozes on this page — other decks' clozes on
-  // the same page are left alone (they aren't even visible right now). The
-  // page anchor only gets cleaned up once the page has no clozes left at all.
   const clearCurrentPageClozes = () => {
     const page = currentPage;
-    const anchor = pagesRef.current[page]?.anchor ?? null;
-    let becameEmpty = false;
     setPages(prev => {
       const existing = prev[page];
       if (!existing) {
         return prev;
       }
       const clozes = existing.clozes.filter(c => c.deckId !== activeDeckId);
-      becameEmpty = clozes.length === 0;
-      return {
-        ...prev,
-        [page]: {
-          ...existing,
-          clozes,
-          anchor: becameEmpty ? null : existing.anchor,
-        },
-      };
+      return {...prev, [page]: {...existing, clozes}};
     });
-    if (becameEmpty && anchor && notePathRef.current) {
-      deletePageAnchor(notePathRef.current, page, anchor);
-    }
   };
 
   // Deck CRUD. Decks are note-level metadata; clozes reference a deckId.
@@ -962,43 +819,41 @@ function App(): React.JSX.Element {
     setDecks(prev => prev.map(d => (d.id === id ? {...d, name: trimmed} : d)));
   }, []);
 
-  // Deletes a deck and every cloze tagged with it (across all pages), cleaning
-  // up each affected page's off-canvas marker if it becomes clozeless. Refuses
-  // to delete the last remaining deck.
-  const deleteDeckAndClozes = useCallback(
-    async (id: string) => {
-      if (decksRef.current.length <= 1) {
-        return;
+  // Deletes a deck and every cloze in it. We have to update both `pages`
+  // (for pages we've visited) and persistedDataRef directly, since clozes on
+  // pages we haven't visited this session only live in persistedDataRef.
+  // Keeps at least the last deck around, since clozes need a deck to live in.
+  const deleteDeckAndClozes = useCallback((id: string) => {
+    if (decksRef.current.length <= 1) {
+      return;
+    }
+    setPages(prev => {
+      const next: Record<number, PageState> = {};
+      for (const [pStr, ps] of Object.entries(prev)) {
+        next[Number(pStr)] = {
+          ...ps,
+          clozes: ps.clozes.filter(c => c.deckId !== id),
+        };
       }
-      const notePath = notePathRef.current;
-      if (notePath) {
-        for (const [pStr, ps] of Object.entries(pagesRef.current)) {
-          const willBeEmpty =
-            ps.clozes.length > 0 && ps.clozes.every(c => c.deckId === id);
-          if (willBeEmpty && ps.anchor) {
-            await deletePageAnchor(notePath, Number(pStr), ps.anchor);
-          }
+      return next;
+    });
+    const data = persistedDataRef.current;
+    if (data) {
+      for (const uuid of Object.keys(data.pagesByUuid)) {
+        const filtered = data.pagesByUuid[uuid].filter(c => c.deckId !== id);
+        if (filtered.length === 0) {
+          delete data.pagesByUuid[uuid];
+        } else {
+          data.pagesByUuid[uuid] = filtered;
         }
       }
-      setPages(prev => {
-        const next: Record<number, PageState> = {};
-        for (const [pStr, ps] of Object.entries(prev)) {
-          const clozes = ps.clozes.filter(c => c.deckId !== id);
-          next[Number(pStr)] =
-            clozes.length === 0
-              ? {...ps, clozes: [], anchor: null}
-              : {...ps, clozes};
-        }
-        return next;
-      });
-      const remaining = decksRef.current.filter(d => d.id !== id);
-      setDecks(remaining);
-      if (activeDeckIdRef.current === id) {
-        setActiveDeckId(remaining[0]?.id ?? DEFAULT_DECK_ID);
-      }
-    },
-    [deletePageAnchor],
-  );
+    }
+    const remaining = decksRef.current.filter(d => d.id !== id);
+    setDecks(remaining);
+    if (activeDeckIdRef.current === id) {
+      setActiveDeckId(remaining[0]?.id ?? DEFAULT_DECK_ID);
+    }
+  }, []);
 
   const deckClozeCounts = useMemo(() => {
     const counts = new Map<string, number>();
